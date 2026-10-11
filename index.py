@@ -94,6 +94,7 @@ def classify(ip: str, ua: str) -> dict:
                 break
     return out
 
+# --- UPDATED: Safe handling of Upstash Redis responses & fail-open routing ---
 async def kv_setnx(key: str, ttl: int) -> bool:
     if not KV_URL or not KV_TOKEN:
         return _local_setnx(key, ttl)
@@ -106,10 +107,11 @@ async def kv_setnx(key: str, ttl: int) -> bool:
                 params={"NX": "1", "EX": str(ttl)},
             )
             r.raise_for_status()
-            return r.json().get("result") == "OK"
+            res_data = r.json()
+            return res_data.get("result") == "OK"
         except Exception as e:
             log.error(f"External KV storage failure: {e}")
-            return False
+            return True  # Fail open on serverless timeout to prevent locking real users out
 
 _LOCAL_SEEN: dict[str, float] = {}
 
@@ -192,7 +194,7 @@ async def landing(token: str):
 
     html = render_template_string(
         LANDING,
-        action=f"/submit/{token}",  # Points cleanly to distinct submission route
+        action=f"/submit/{token}",
         token=token,
         nonce=nonce,
         title=data.get("title", "Confirm your request"),
@@ -235,7 +237,6 @@ async def execute(token: str):
     if not (is_nonce_valid and is_token_valid and is_fresh):
         return _static_page("Verification Failed", "Security context verification payload mismatched.", 400)
 
-    # Atomic distributed validation block to strictly deny race conditions across serverless instances
     is_first_click = await kv_setnx(f"click:{token[:32]}:{submitted_nonce}", GATE_TTL)
     if not is_first_click:
         return _static_page("Link Consumed", "This single-use action link has already been utilized.", 410)
@@ -245,4 +246,3 @@ async def execute(token: str):
     except (SignatureExpired, BadSignature):
         return _static_page("Invalid Token", "Target signature metadata validation error.", 410)
 
-    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
