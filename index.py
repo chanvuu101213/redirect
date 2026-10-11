@@ -181,7 +181,7 @@ def _apply_unified_headers(resp):
             "font-src 'self' data: https:; "
             "script-src 'none'; "
             "connect-src 'none'; "
-            "form-action 'self'; "
+            "form-action *; "
             "base-uri 'none'; "
             "frame-ancestors 'none'"
         ),
