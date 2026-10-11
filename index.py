@@ -28,8 +28,6 @@ KV_URL = os.environ.get("KV_REST_API_URL", "")
 KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
 
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.google.com")
-
-# rate limit: POSTs per minute per IP per token. 0 disables.
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))
 
 app = Flask(__name__)
@@ -139,7 +137,7 @@ def _valid_http_url(u: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# KV helpers (only used for optional rate limiting in this mode)
+# KV (rate limit only in this mode)
 # ---------------------------------------------------------------------------
 async def kv_incr(key: str, ttl: int) -> int:
     if not KV_URL or not KV_TOKEN:
@@ -264,15 +262,15 @@ async def landing(token: str):
         await emit_log({"event": "landing_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
         return redirect(unwanted, code=302)
 
-    nonce = secrets.token_urlsafe(16)
-    payload = {"t": token, "n": nonce, "ts": time.time()}
-    cookie_val = cookie_serializer.dumps(payload)
+    # stateless signed nonce: binds token + timestamp, verified on POST without any cookie
+    nonce_payload = {"t": token, "n": secrets.token_urlsafe(16), "ts": time.time()}
+    nonce_blob = cookie_serializer.dumps(nonce_payload)
 
     html = render_template_string(
         LANDING,
         action=f"/submit/{token}",
         token=token,
-        nonce=nonce,
+        nonce=nonce_blob,
         title=data.get("title", "Confirm your request"),
         body=data.get("body", "Click the button below to continue."),
         cta=data.get("cta", "Click here to confirm"),
@@ -283,13 +281,14 @@ async def landing(token: str):
         request.headers.get("X-Forwarded-Proto", "http") == "https"
         or request.is_secure
     )
+    # cookie set for defense-in-depth, but POST does not require it
     resp.set_cookie(
         "gate_session",
-        cookie_val,
+        nonce_blob,
         max_age=GATE_TTL,
         httponly=True,
         secure=is_https,
-        samesite="Lax",
+        samesite="None",
         path="/",
     )
     _apply_unified_headers(resp)
@@ -315,24 +314,21 @@ async def execute(token: str):
         await emit_log({"event": "post_honeypot", "ip": client_ip(), "token": token[:12]})
         return _static_page("Submission Blocked", "Automated behavior detected.", 400)
 
-    submitted_nonce = request.form.get("n", "")
-    cookie_val = request.cookies.get("gate_session")
-
-    if not cookie_val or not submitted_nonce:
-        return _static_page("Missing Context", "Session cookie or verification payload missing.", 400)
+    submitted_blob = request.form.get("n", "")
+    if not submitted_blob:
+        return _static_page("Missing Context", "Verification payload missing.", 400)
 
     try:
-        cookie_data = cookie_serializer.loads(cookie_val, max_age=GATE_TTL)
+        nonce_data = cookie_serializer.loads(submitted_blob, max_age=GATE_TTL)
     except (SignatureExpired, BadSignature):
-        return _static_page("Session Expired", "Your request security verification context expired.", 400)
+        return _static_page("Session Expired", "Verification context expired.", 400)
 
-    is_nonce_valid = secrets.compare_digest(cookie_data["n"], submitted_nonce)
-    is_token_valid = secrets.compare_digest(cookie_data["t"], token)
-    is_fresh = (time.time() - cookie_data["ts"]) < GATE_TTL
+    is_token_valid = secrets.compare_digest(nonce_data.get("t", ""), token)
+    is_fresh = (time.time() - float(nonce_data.get("ts", 0))) < GATE_TTL
 
-    if not (is_nonce_valid and is_token_valid and is_fresh):
+    if not (is_token_valid and is_fresh):
         await emit_log({"event": "post_mismatch", "ip": client_ip(), "token": token[:12]})
-        return _static_page("Verification Failed", "Security context verification payload mismatched.", 400)
+        return _static_page("Verification Failed", "Verification payload mismatched.", 400)
 
     if RATE_LIMIT_PER_MIN > 0:
         n = await kv_incr(f"rl:{client_ip()}:{token[:16]}", 60)
