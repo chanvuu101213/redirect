@@ -8,9 +8,10 @@ from ipaddress import ip_address, ip_network
 import httpx
 from flask import (
     Flask, request, redirect, render_template_string,
-    abort, make_response, jsonify,
+    make_response, jsonify,
 )
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from asgiref.wsgi import WsgiToAsgi
 
 # ---------------------------------------------------------------------------
 # config
@@ -36,7 +37,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
-# scanner networks & UAs
+# known scanner networks & UAs
 # ---------------------------------------------------------------------------
 EOP = [
     ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
@@ -135,12 +136,7 @@ def _static_page(title: str, text: str, status_code: int):
     <style>body{{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9}}
     .c{{background:#fff;padding:2rem;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.05);text-align:center;max-width:400px}}</style>
     </head><body><div class="c"><h1>{title}</h1><p>{text}</p></div></body></html>"""
-    resp = make_response(html, status_code)
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    return resp
+    return make_response(html, status_code)
 
 LANDING = """<!doctype html>
 <html lang="en">
@@ -177,11 +173,7 @@ LANDING = """<!doctype html>
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
 
-@app.route("/", methods=["GET"])
-def root():
-    return _static_page("Not found", "Nothing here.", 404)
-
-
+# --- ROUTE 1: Clean GET Landing Page Execution Only ---
 @app.route("/r/<token>", methods=["GET"])
 async def landing(token: str):
     try:
@@ -200,47 +192,29 @@ async def landing(token: str):
 
     html = render_template_string(
         LANDING,
-        action=f"/submit/{token}",
+        action=f"/submit/{token}",  # Points cleanly to distinct submission route
         token=token,
         nonce=nonce,
         title=data.get("title", "Confirm your request"),
         body=data.get("body", "Click the button below to continue."),
         cta=data.get("cta", "Click here to confirm"),
     )
-
+    
     resp = make_response(html)
-    is_https = (
-        request.headers.get("X-Forwarded-Proto", "http") == "https"
-        or request.is_secure
-    )
     resp.set_cookie(
         "gate_session",
         cookie_val,
         max_age=GATE_TTL,
         httponly=True,
-        secure=is_https,
-        samesite="Lax",
-        path="/",
+        secure=True,
+        samesite="Lax"
     )
-    resp.headers.update({
-        "Cache-Control": "no-store, no-cache, must-revalidate, private",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "X-Frame-Options": "DENY",
-        "X-Content-Type-Options": "nosniff",
-        "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": (
-            "default-src 'none'; style-src 'unsafe-inline'; "
-            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-        ),
-    })
     return resp
 
-
+# --- ROUTE 2: Clean POST Verification Processing Only ---
 @app.route("/submit/<token>", methods=["POST"])
 async def execute(token: str):
     if request.form.get("email_confirm_hp"):
-        await emit_log({"event": "post_honeypot", "ip": client_ip(), "token": token[:12]})
         return _static_page("Submission Blocked", "Automated behavior detected.", 400)
 
     submitted_nonce = request.form.get("n", "")
@@ -259,50 +233,16 @@ async def execute(token: str):
     is_fresh = (time.time() - cookie_data["ts"]) < GATE_TTL
 
     if not (is_nonce_valid and is_token_valid and is_fresh):
-        await emit_log({"event": "post_mismatch", "ip": client_ip(), "token": token[:12]})
         return _static_page("Verification Failed", "Security context verification payload mismatched.", 400)
 
     is_first_click = await kv_setnx(f"click:{token[:32]}:{submitted_nonce}", GATE_TTL)
     if not is_first_click:
-        await emit_log({"event": "post_replay", "ip": client_ip(), "token": token[:12]})
         return _static_page("Link Consumed", "This single-use action link has already been utilized.", 410)
 
     try:
         data = serializer.loads(token, max_age=TOKEN_TTL)
-    except SignatureExpired:
-        return _static_page("Link expired", "This link is no longer valid.", 410)
-    except BadSignature:
-        return _static_page("Invalid link", "This link is not valid.", 404)
+    except (SignatureExpired, BadSignature):
+        return _static_page("Invalid Token", "Target signature metadata validation error.", 410)
 
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
-    await emit_log({"event": "post_ok", **tag, "token": token[:12]})
-
-    resp = make_response(redirect(data["target"], code=303))
-    resp.delete_cookie("gate_session", path="/")
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    return resp
-
-
-# ---------------------------------------------------------------------------
-# admin: mint a gated link
-# ---------------------------------------------------------------------------
-@app.route("/mint", methods=["POST"])
-def mint():
-    admin_key = os.environ.get("ADMIN_KEY", "")
-    if not admin_key or request.headers.get("X-Admin-Key") != admin_key:
-        abort(404)
-    body = request.get_json(silent=True) or {}
-    target = body.get("target")
-    if not isinstance(target, str) or not target.startswith(("http://", "https://")):
-        return jsonify({"error": "target required"}), 400
-    tok = serializer.dumps({
-        "target": target,
-        "title": body.get("title", "Confirm your request"),
-        "body": body.get("body", "Click the button below to continue."),
-        "cta": body.get("cta", "Click here to confirm"),
-    })
-    base = request.host_url.rstrip("/")
-    return jsonify({"url": f"{base}/r/{tok}", "token": tok})
+    await emit_log({"event": "landing_post", **tag, "token": token[:12]})
