@@ -246,7 +246,4 @@ async def execute(token: str):
 
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     await emit_log({"event": "landing_post", **tag, "token": token[:12]})
-resp = make_response(redirect(data["target"], code=303))
-resp.delete_cookie("gate_session")
-return resp
-asgi_app = WsgiToAsgi(app)
+
