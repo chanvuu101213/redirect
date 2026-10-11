@@ -28,10 +28,9 @@ KV_URL = os.environ.get("KV_REST_API_URL", "")
 KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
 
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.google.com")
-ALLOWED_DECOY_HOSTS = {
-    h.strip().lower() for h in
-    os.environ.get("ALLOWED_DECOY_HOSTS", "").split(",") if h.strip()
-}
+
+# rate limit: POSTs per minute per IP per token. 0 disables.
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
@@ -140,37 +139,23 @@ def _valid_http_url(u: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# KV one-time store
+# KV helpers (only used for optional rate limiting in this mode)
 # ---------------------------------------------------------------------------
-async def kv_setnx(key: str, ttl: int) -> bool:
+async def kv_incr(key: str, ttl: int) -> int:
     if not KV_URL or not KV_TOKEN:
-        return _local_setnx(key, ttl)
+        return 0
     async with httpx.AsyncClient(timeout=3.0) as c:
         try:
             r = await c.post(
-                f"{KV_URL}/set/{key}",
+                f"{KV_URL}/incr/{key}",
                 headers={"Authorization": f"Bearer {KV_TOKEN}"},
-                content=b"1",
-                params={"NX": "1", "EX": str(ttl)},
+                params={"EX": str(ttl)},
             )
             r.raise_for_status()
-            return r.json().get("result") == "OK"
+            return int(r.json().get("result") or 0)
         except Exception as e:
-            log.error(json.dumps({"event": "kv_unavailable_fail_open", "err": str(e), "key": key[:32]}))
-            return True
-
-
-_LOCAL_SEEN: dict = {}
-
-
-def _local_setnx(key: str, ttl: int) -> bool:
-    now = time.time()
-    for k in [k for k, exp in _LOCAL_SEEN.items() if exp < now]:
-        _LOCAL_SEEN.pop(k, None)
-    if key in _LOCAL_SEEN:
-        return False
-    _LOCAL_SEEN[key] = now + ttl
-    return True
+            log.error(json.dumps({"event": "kv_incr_failed", "err": str(e), "key": key[:32]}))
+            return 0
 
 
 async def emit_log(event: dict) -> None:
@@ -252,7 +237,7 @@ LANDING = """<!doctype html>
 # ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "ts": int(time.time())})
+    return jsonify({"ok": True, "ts": int(time.time()), "mode": "broadcast"})
 
 
 @app.route("/", methods=["GET"])
@@ -349,10 +334,11 @@ async def execute(token: str):
         await emit_log({"event": "post_mismatch", "ip": client_ip(), "token": token[:12]})
         return _static_page("Verification Failed", "Security context verification payload mismatched.", 400)
 
-    is_first_click = await kv_setnx(f"click:{token[:32]}:{submitted_nonce}", GATE_TTL)
-    if not is_first_click:
-        await emit_log({"event": "post_replay", "ip": client_ip(), "token": token[:12]})
-        return _static_page("Link Consumed", "This single-use action link has already been utilized.", 410)
+    if RATE_LIMIT_PER_MIN > 0:
+        n = await kv_incr(f"rl:{client_ip()}:{token[:16]}", 60)
+        if n and n > RATE_LIMIT_PER_MIN:
+            await emit_log({"event": "post_ratelimited", "ip": client_ip(), "token": token[:12], "n": n})
+            return _static_page("Too Many Requests", "Please wait before trying again.", 429)
 
     try:
         data = serializer.loads(token, max_age=TOKEN_TTL)
@@ -370,7 +356,7 @@ async def execute(token: str):
 
 
 # ---------------------------------------------------------------------------
-# admin: mint a gated link
+# admin: mint
 # ---------------------------------------------------------------------------
 @app.route("/mint", methods=["POST"])
 def mint():
@@ -400,6 +386,7 @@ def mint():
     return jsonify({
         "url": f"{base}/r/{tok}",
         "token": tok,
+        "mode": "broadcast",
         "unwanted_target": unwanted_target or UNWANTED_REDIRECT_URL,
     })
 
