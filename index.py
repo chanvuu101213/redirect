@@ -100,9 +100,6 @@ SCANNER_UA_TOKENS = (
     "newrelic", "datadog synthetics", "yahoo", "aol", "verizon", "symantec", "webpulse", "bluecoat", "messagelabs",
 )
 
-# In-memory store for one-time tokens
-USED_TOKENS = set()
-
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else request.remote_addr or ""
@@ -365,12 +362,7 @@ def execute(token: str):
     if not secrets.compare_digest(nonce_data.get("t", ""), token):
         return _static_page("Verification Failed", "Verification payload mismatched.", 400)
 
-    # 1. Check One-Time Token
-    if token in USED_TOKENS:
-        return _static_page("Verification Failed", "Token already used.", 400)
-    USED_TOKENS.add(token)
-
-    # 2. Check Proof of Work
+    # 1. Check Proof of Work
     submitted_pow = request.form.get("pow_nonce", "")
     seed = nonce_data.get("challenge", "")
     
@@ -381,7 +373,7 @@ def execute(token: str):
     if not test_hash.startswith("0000"):
         return _static_page("Verification Failed", "Invalid PoW.", 400)
 
-    # 3. Check Telemetry
+    # 2. Check Telemetry
     drag_time = int(request.form.get("drag_time", 0))
     drag_events = int(request.form.get("drag_events", 0))
 
