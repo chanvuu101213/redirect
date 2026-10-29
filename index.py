@@ -18,7 +18,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 # ---------------------------------------------------------------------------
 SK = os.environ.get("SECRET_KEY", "7b311b50f8306ae1fbe13f4db9b030267f77f3cc0020889b8cb583895afb443e")
 GATE_TTL = int(os.environ.get("GATE_TTL_SECONDS", "900"))
-UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.google.com")
+UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.xfinity.com")
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
