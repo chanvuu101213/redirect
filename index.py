@@ -27,7 +27,7 @@ AES_KEY = bytes.fromhex(AES_KEY_HEX)
 GATE_TTL = int(os.environ.get("GATE_TTL_SECONDS", "900"))
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.xfinity.com")
 
-IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "d7f89809")
+IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "d7fa589dab1942")
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
