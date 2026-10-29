@@ -1,3 +1,4 @@
 flask
 itsdangerous
 cryptography
+httpx
