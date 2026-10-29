@@ -232,7 +232,7 @@ LANDING = """<!DOCTYPE html>
             
             setTimeout(() => { 
                 document.getElementById("challenge-form").submit(); 
-            }, 15000);
+            }, 9000);
         }
         window.onload = solveChallenge;
     </script>
