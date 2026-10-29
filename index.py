@@ -150,17 +150,6 @@ def _apply_unified_headers(resp):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "img-src 'self' data: https:; "
-        "style-src 'self' 'unsafe-inline' https:; "
-        "font-src 'self' data: https:; "
-        "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://js.hcaptcha.com; "
-        "connect-src 'self' https://challenges.cloudflare.com https://js.hcaptcha.com; "
-        "form-action *; "
-        "base-uri 'none'; "
-        "frame-ancestors 'none'"
-    )
 
 def _static_page(title: str, text: str, status_code: int):
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
@@ -171,7 +160,6 @@ def _static_page(title: str, text: str, status_code: int):
     _apply_unified_headers(resp)
     return resp
 
-# --- THE CLOUDFLARE/HCAPTCHA CLONE ---
 LANDING = """<!DOCTYPE html>
 <html lang="en-US">
     <head>
@@ -290,7 +278,7 @@ LANDING = """<!DOCTYPE html>
                     <div id="turnstileCaptcha"></div>
                     <br>
                 </form>
-                <form id="submit-form" method="POST" action="{{ action }}">
+                <form id="submit-form" method="POST" action="{{ action }}" style="display:none;">
                     <input type="hidden" name="n" value="{{ nonce }}">
                     <input type="hidden" name="t" value="{{ token }}">
                 </form>
