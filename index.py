@@ -244,7 +244,7 @@ LANDING = """<!DOCTYPE html>
         
         <!-- Subtle Instruction -->
         <div id="instruction" class="instruction-text">
-            Please move your mouse or tap the screen to continue.
+            Please hover your mouse here or tap the screen to continue.
         </div>
     </div>
     
