@@ -267,11 +267,11 @@ LANDING = """<!DOCTYPE html>
                 // Change the instruction to green "Verified"
                 const inst = document.getElementById('instruction');
                 inst.className = 'instruction-text verified';
-                inst.textContent = 'Verified. Waiting for redirect...';
+                inst.textContent = 'Verification successful. Waiting for the site to respond...';
                 
                 // Change the title to match a successful check
                 document.getElementById('status-title').textContent = 'Connection is secure.';
-                document.getElementById('spinner').style.display = 'none';
+                // The spinner element is NOT hidden here anymore, so it keeps spinning.
             }
         }
 
