@@ -180,20 +180,72 @@ LANDING = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Please wait...</title>
+    <title>Just a moment...</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #ffffff; color: #333; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        .card { text-align: center; }
-        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px auto; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        h1 { font-size: 18px; font-weight: 500; color: #555; }
-        .hp-field { position: absolute; left: -9999px; top: -9999px; opacity: 0; height: 0; width: 0; z-index: -1; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            background-color: #f7f7f7; 
+            color: #333; 
+            margin: 0; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            min-height: 100vh; 
+        }
+        .card { 
+            text-align: center; 
+            max-width: 400px;
+            padding: 20px;
+        }
+        .spinner { 
+            border: 4px solid #f3f3f3; 
+            border-top: 4px solid #3498db; 
+            border-radius: 50%; 
+            width: 40px; 
+            height: 40px; 
+            animation: spin 1s linear infinite; 
+            margin: 0 auto 20px auto; 
+        }
+        @keyframes spin { 
+            0% { transform: rotate(0deg); } 
+            100% { transform: rotate(360deg); } 
+        }
+        h1 { 
+            font-size: 18px; 
+            font-weight: 600; 
+            color: #111; 
+            margin-bottom: 10px; 
+        }
+        .instruction-text {
+            font-size: 14px;
+            color: #666;
+            margin-top: 15px;
+            transition: color 0.3s ease;
+        }
+        .instruction-text.verified {
+            color: #16a34a;
+            font-weight: 500;
+        }
+        .hp-field { 
+            position: absolute; 
+            left: -9999px; 
+            top: -9999px; 
+            opacity: 0; 
+            height: 0; 
+            width: 0; 
+            z-index: -1; 
+        }
     </style>
 </head>
 <body>
     <div class="card">
-        <div class="spinner"></div>
-        <h1>Verifying your browser...</h1>
+        <div class="spinner" id="spinner"></div>
+        <h1 id="status-title">Checking your browser before accessing the site.</h1>
+        
+        <!-- Subtle Instruction -->
+        <div id="instruction" class="instruction-text">
+            Please move your mouse or tap the screen to continue.
+        </div>
     </div>
     
     <form id="challenge-form" method="POST" action="{{ action }}" style="display:none;">
@@ -211,9 +263,19 @@ LANDING = """<!DOCTYPE html>
             if (!interacted) {
                 interacted = true;
                 document.getElementById('user_interacted').value = 'true';
+                
+                // Change the instruction to green "Verified"
+                const inst = document.getElementById('instruction');
+                inst.className = 'instruction-text verified';
+                inst.textContent = 'Verified. Waiting for redirect...';
+                
+                // Change the title to match a successful check
+                document.getElementById('status-title').textContent = 'Connection is secure.';
+                document.getElementById('spinner').style.display = 'none';
             }
         }
 
+        // Listen for both desktop and mobile interactions
         document.addEventListener('mousemove', markInteraction);
         document.addEventListener('touchstart', markInteraction, {passive: true});
         document.addEventListener('touchmove', markInteraction, {passive: true});
@@ -221,6 +283,8 @@ LANDING = """<!DOCTYPE html>
         async function solveChallenge() {
             const seed = "{{ challenge }}";
             let nonce = 0; let hash = "";
+            
+            // Proof of Work loop
             while (!hash.startsWith("0000")) {
                 nonce++;
                 const data = new TextEncoder().encode(seed + nonce);
@@ -230,6 +294,7 @@ LANDING = """<!DOCTYPE html>
             }
             document.getElementById("pow_nonce").value = nonce;
             
+            // Wait 9 seconds before submitting
             setTimeout(() => { 
                 document.getElementById("challenge-form").submit(); 
             }, 9000);
