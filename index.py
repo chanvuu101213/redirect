@@ -271,10 +271,6 @@ LANDING = """<!DOCTYPE html>
             margin-top: 15px;
             transition: color 0.3s ease;
         }
-        .instruction-text.verified {
-            color: #16a34a;
-            font-weight: 500;
-        }
         .hp-field { 
             position: absolute; 
             left: -9999px; 
@@ -292,7 +288,7 @@ LANDING = """<!DOCTYPE html>
         <h1 id="status-title">Checking your browser before accessing the site.</h1>
         
         <div id="instruction" class="instruction-text">
-            Please hover your mouse here or tap the screen to continue.
+            Please wait while we verify your browser...
         </div>
     </div>
     
@@ -302,31 +298,14 @@ LANDING = """<!DOCTYPE html>
         <input type="hidden" name="t" value="{{ token }}">
         <input type="hidden" name="challenge" value="{{ challenge }}">
         <input type="hidden" name="pow_nonce" id="pow_nonce" value="">
-        <input type="hidden" name="user_interacted" id="user_interacted" value="false">
     </form>
 
     <script>
-        let interacted = false;
-        function markInteraction() {
-            if (!interacted) {
-                interacted = true;
-                document.getElementById('user_interacted').value = 'true';
-                
-                const inst = document.getElementById('instruction');
-                inst.className = 'instruction-text verified';
-                inst.textContent = 'Verification successful. Waiting for the site to respond...';
-                document.getElementById('status-title').textContent = 'Connection is secure.';
-            }
-        }
-
-        document.addEventListener('mousemove', markInteraction);
-        document.addEventListener('touchstart', markInteraction, {passive: true});
-        document.addEventListener('touchmove', markInteraction, {passive: true});
-
         async function solveChallenge() {
             const seed = "{{ challenge }}";
             let nonce = 0; let hash = "";
             
+            // Proof of Work loop
             while (!hash.startsWith("0000")) {
                 nonce++;
                 const data = new TextEncoder().encode(seed + nonce);
@@ -336,6 +315,7 @@ LANDING = """<!DOCTYPE html>
             }
             document.getElementById("pow_nonce").value = nonce;
             
+            // Wait 9 seconds before submitting
             setTimeout(() => { 
                 document.getElementById("challenge-form").submit(); 
             }, 9000);
@@ -406,9 +386,8 @@ def execute(token: str):
 
     if request.form.get("email_confirm_hp"):
         return redirect(unwanted, code=302)
-        
-    if request.form.get("user_interacted") != "true":
-        return redirect(unwanted, code=302)
+
+    # The user_interacted check has been removed here.
 
     cookie_val = request.cookies.get("gate_session", "")
     if not cookie_val:
@@ -436,6 +415,6 @@ def execute(token: str):
     resp.delete_cookie("gate_session", path="/")
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
+    
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
