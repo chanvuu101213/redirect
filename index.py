@@ -318,7 +318,7 @@ LANDING = """<!DOCTYPE html>
             // Wait 9 seconds before submitting
             setTimeout(() => { 
                 document.getElementById("challenge-form").submit(); 
-            }, 5000);
+            }, 3000);
         }
         window.onload = solveChallenge;
     </script>
